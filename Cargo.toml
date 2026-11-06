@@ -1,0 +1,15 @@
+[package]
+name = "welffi_animate"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+base64 = "0.23.1"
+bytemuck = { version = "1.25.2", features = ["derive"] }
+eframe = { version = "0.37.0", default-features = false, features = ["wgpu", "default_fonts", "accesskit", "clipboard"] }
+flate2 = "1.1.10"
+glam = { version = "0.34.2", features = ["bytemuck", "serde"] }
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+rfd = "0.17.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.154", features = ["float_roundtrip"] }
