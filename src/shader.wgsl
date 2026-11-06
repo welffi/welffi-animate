@@ -2,6 +2,7 @@ struct Uniforms {
     mvp: mat4x4<f32>,
     model: mat4x4<f32>,
     tint: vec4<f32>,
+    color: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -25,7 +26,7 @@ fn mesh_vs(@location(0) pos: vec3<f32>, @location(1) normal: vec3<f32>, @locatio
 
 @fragment
 fn mesh_fs(in: MeshOut) -> @location(0) vec4<f32> {
-    let base = textureSample(skin, skin_sampler, in.uv).rgb;
+    let base = textureSample(skin, skin_sampler, in.uv).rgb * u.color.rgb;
     let n = normalize(in.normal);
     let key = max(dot(n, normalize(vec3<f32>(0.4, 0.8, -0.6))), 0.0);
     let fill = max(dot(n, normalize(vec3<f32>(-0.5, 0.2, 0.7))), 0.0);

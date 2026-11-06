@@ -4,7 +4,6 @@ use crate::editor::Editor;
 use crate::graph::Graph;
 use crate::menus::{self, Menu, MenuKind};
 use crate::nametags;
-use crate::rig::JOINT_COUNT;
 use eframe::egui::{self, Align2, Color32, CornerRadius, Event, FontId, Key, Modifiers, PointerButton, Pos2, Rect, Sense, Shape, Stroke, StrokeKind, Vec2};
 use std::collections::BTreeSet;
 
@@ -42,6 +41,7 @@ pub struct Layout {
     pub keys_left: f32,
     start: f32,
     pub pixels_per_frame: f32,
+    rows: usize,
 }
 
 impl Layout {
@@ -67,7 +67,7 @@ impl Layout {
 
     fn row_at(&self, y: f32) -> Option<usize> {
         let row = ((y - self.body_top()) / ROW_HEIGHT).floor();
-        (row >= 0.0 && row <= JOINT_COUNT as f32).then_some(row as usize)
+        (row >= 0.0 && row <= self.rows as f32).then_some(row as usize)
     }
 }
 
@@ -80,7 +80,7 @@ impl Timeline {
         let rect = ui.available_rect_before_wrap();
         let response = ui.allocate_rect(rect, Sense::click_and_drag());
         self.hovered = response.hovered() || response.dragged();
-        let layout = Layout { rect, keys_left: rect.left() + NAME_WIDTH, start: self.start, pixels_per_frame: self.pixels_per_frame };
+        let layout = Layout { rect, keys_left: rect.left() + NAME_WIDTH, start: self.start, pixels_per_frame: self.pixels_per_frame, rows: ed.anim.tracks.len() };
         let pointer = ui.input(|i| i.pointer.hover_pos());
 
         self.zoom_and_pan(ui, &response, &layout);
@@ -257,6 +257,7 @@ impl Timeline {
                 Key::A if modifiers.alt => ed.keys.clear(),
                 Key::A if self.graph_mode => self.graph.select_all(ed),
                 Key::A => ed.keys = ed.anim.all_keys(),
+                Key::E if modifiers.shift && !ed.keys.is_empty() => self.menu = open(MenuKind::Extend),
                 Key::T if !ed.keys.is_empty() => self.menu = open(MenuKind::Interp),
                 Key::V if !ed.keys.is_empty() => self.menu = open(MenuKind::Handle),
                 _ => {}
@@ -267,7 +268,7 @@ impl Timeline {
     fn paint_rows(&self, ui: &egui::Ui, layout: &Layout, ed: &Editor, pointer: Option<Pos2>) {
         let painter = ui.painter_at(layout.rect);
         let rect = layout.rect;
-        for row in 0..=JOINT_COUNT {
+        for row in 0..=ed.anim.tracks.len() {
             let y = layout.row_y(row);
             let row_rect = Rect::from_center_size(Pos2::new(rect.center().x, y), Vec2::new(rect.width(), ROW_HEIGHT));
             let selected = row > 0 && ed.parts.contains(&(row - 1));
@@ -276,7 +277,7 @@ impl Timeline {
             } else if row % 2 == 1 {
                 painter.rect_filled(row_rect, CornerRadius::ZERO, Color32::from_white_alpha(4));
             }
-            let name = if row == 0 { "Summary" } else { ed.rig.joints[row - 1].part };
+            let name = if row == 0 { "Summary" } else { &ed.rig.joints[row - 1].part };
             let color = if selected { SELECTED_KEY } else if row == 0 { Color32::from_gray(200) } else { ui.visuals().text_color() };
             painter.text(Pos2::new(rect.left() + 10.0, y), Align2::LEFT_CENTER, name, FontId::proportional(13.0), color);
         }
@@ -378,7 +379,7 @@ fn key_at(layout: &Layout, ed: &Editor, p: Pos2) -> Option<BTreeSet<KeyId>> {
         return None;
     }
     let found: BTreeSet<KeyId> = if row == 0 {
-        (0..JOINT_COUNT).filter(|&j| ed.anim.tracks[j].key_at(frame).is_some()).map(|j| (j, frame)).collect()
+        (0..ed.anim.tracks.len()).filter(|&j| ed.anim.tracks[j].key_at(frame).is_some()).map(|j| (j, frame)).collect()
     } else {
         ed.anim.tracks[row - 1].key_at(frame).map(|_| (row - 1, frame)).into_iter().collect()
     };

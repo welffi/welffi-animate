@@ -1,12 +1,23 @@
-use crate::ik::Leg;
+use crate::ik::{Leg, HIP_HEIGHT};
+use crate::props::Prop;
 use glam::{Mat4, Quat, Vec3, Vec4};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 
-pub const JOINT_COUNT: usize = 6;
+pub const MESH_COUNT: usize = 6;
+pub const JOINT_COUNT: usize = 8;
 pub const TORSO: usize = 0;
+pub const LEFT_ARM: usize = 2;
+pub const RIGHT_ARM: usize = 3;
+pub const LEFT_LEG: usize = 4;
+pub const RIGHT_LEG: usize = 5;
+pub const LEFT_HIP: usize = 6;
+pub const RIGHT_HIP: usize = 7;
+const TORSO_PIVOT: f32 = -0.823;
+pub const BODY_PARTS: [&str; JOINT_COUNT] = ["Torso", "Head", "Left Arm", "Right Arm", "Left Leg", "Right Leg", "Left Hip", "Right Hip"];
 
 pub struct Joint {
-    pub part: &'static str,
+    pub part: String,
     pub parent: Option<usize>,
     pub mirror: usize,
     pub c0: Mat4,
@@ -93,33 +104,68 @@ fn joint_cf(x: f32, y: f32, z: f32, r: [f32; 9]) -> Mat4 {
     cframe([x, y, z, r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8]])
 }
 
-pub fn joints() -> [Joint; JOINT_COUNT] {
-    [
-        Joint { part: "Torso", parent: None, mirror: 0, c0: joint_cf(0.0, 0.0, 0.0, TORSO_FRAME), c1: joint_cf(0.0, 0.0, 0.0, TORSO_FRAME) },
-        Joint { part: "Head", parent: Some(TORSO), mirror: 1, c0: joint_cf(0.0, 1.0, 0.0, TORSO_FRAME), c1: joint_cf(0.0, -0.5, 0.0, TORSO_FRAME) },
-        Joint { part: "Left Arm", parent: Some(TORSO), mirror: 3, c0: joint_cf(-1.0, 0.5, 0.0, LEFT_FRAME), c1: joint_cf(0.5, 0.5, 0.0, LEFT_FRAME) },
-        Joint { part: "Right Arm", parent: Some(TORSO), mirror: 2, c0: joint_cf(1.0, 0.5, 0.0, RIGHT_FRAME), c1: joint_cf(-0.5, 0.5, 0.0, RIGHT_FRAME) },
-        Joint { part: "Left Leg", parent: Some(TORSO), mirror: 5, c0: joint_cf(-1.0, -1.0, 0.0, LEFT_FRAME), c1: joint_cf(-0.5, 1.0, 0.0, LEFT_FRAME) },
-        Joint { part: "Right Leg", parent: Some(TORSO), mirror: 4, c0: joint_cf(1.0, -1.0, 0.0, RIGHT_FRAME), c1: joint_cf(0.5, 1.0, 0.0, RIGHT_FRAME) },
-    ]
+fn body_joints() -> Vec<Joint> {
+    let body = [
+        (None, 0, joint_cf(0.0, 0.0, 0.0, TORSO_FRAME), joint_cf(0.0, 0.0, 0.0, TORSO_FRAME)),
+        (Some(TORSO), 1, joint_cf(0.0, 1.0, 0.0, TORSO_FRAME), joint_cf(0.0, -0.5, 0.0, TORSO_FRAME)),
+        (Some(TORSO), RIGHT_ARM, joint_cf(-1.0, 0.5, 0.0, LEFT_FRAME), joint_cf(0.5, 0.5, 0.0, LEFT_FRAME)),
+        (Some(TORSO), LEFT_ARM, joint_cf(1.0, 0.5, 0.0, RIGHT_FRAME), joint_cf(-0.5, 0.5, 0.0, RIGHT_FRAME)),
+        (Some(TORSO), RIGHT_LEG, joint_cf(-1.0, -1.0, 0.0, LEFT_FRAME), joint_cf(-0.5, 1.0, 0.0, LEFT_FRAME)),
+        (Some(TORSO), LEFT_LEG, joint_cf(1.0, -1.0, 0.0, RIGHT_FRAME), joint_cf(0.5, 1.0, 0.0, RIGHT_FRAME)),
+        (Some(TORSO), RIGHT_HIP, Mat4::from_translation(Vec3::new(-0.5, HIP_HEIGHT, 0.0)), Mat4::IDENTITY),
+        (Some(TORSO), LEFT_HIP, Mat4::from_translation(Vec3::new(0.5, HIP_HEIGHT, 0.0)), Mat4::IDENTITY),
+    ];
+    body.into_iter().zip(BODY_PARTS).map(|((parent, mirror, c0, c1), part)| Joint { part: part.to_string(), parent, mirror, c0, c1 }).collect()
 }
 
-pub const LEFT_LEG: usize = 4;
-pub const RIGHT_LEG: usize = 5;
+pub fn is_hip(joint: usize) -> bool {
+    joint == LEFT_HIP || joint == RIGHT_HIP
+}
+
+fn hip_of(leg: usize) -> usize {
+    if leg == LEFT_LEG { LEFT_HIP } else { RIGHT_HIP }
+}
+
+fn prop_joint(index: usize, prop: &Prop, count: usize) -> Joint {
+    let parent = if prop.parent < count && prop.parent != index { prop.parent } else { RIGHT_ARM };
+    Joint { part: prop.name.clone(), parent: Some(parent), mirror: index, c0: prop.rest.matrix(), c1: Mat4::IDENTITY }
+}
+
+fn parents_first(joints: &[Joint]) -> Vec<usize> {
+    let mut order = Vec::with_capacity(joints.len());
+    let mut placed = vec![false; joints.len()];
+    while order.len() < joints.len() {
+        let waiting: Vec<usize> = (0..joints.len()).filter(|&i| !placed[i]).collect();
+        let ready: Vec<usize> = waiting.iter().copied().filter(|&i| joints[i].parent.is_none_or(|p| placed[p])).collect();
+        for i in if ready.is_empty() { waiting } else { ready } {
+            placed[i] = true;
+            order.push(i);
+        }
+    }
+    order
+}
 
 pub struct Rig {
-    pub joints: [Joint; JOINT_COUNT],
+    pub joints: Vec<Joint>,
     legs: [Leg; 2],
+    order: Vec<usize>,
 }
 
 impl Rig {
+    #[cfg(test)]
     pub fn r6() -> Rig {
-        let joints = joints();
+        Rig::new(&[])
+    }
+
+    pub fn new(props: &[Prop]) -> Rig {
+        let mut joints = body_joints();
+        let count = JOINT_COUNT + props.len();
+        joints.extend(props.iter().enumerate().map(|(k, prop)| prop_joint(JOINT_COUNT + k, prop, count)));
         let rest = |i: usize| root() * joints[i].c0 * joints[i].c1.inverse();
         let torso = rest(TORSO);
         let leg_rest = |i: usize| torso * joints[i].c0 * joints[i].c1.inverse();
-        let legs = [Leg::new(-1.0, torso, leg_rest(LEFT_LEG)), Leg::new(1.0, torso, leg_rest(RIGHT_LEG))];
-        Rig { joints, legs }
+        let legs = [Leg::new(-1.0, torso, leg_rest(LEFT_LEG)), Leg::new(1.0, torso, leg_rest(RIGHT_LEG))];        let order = parents_first(&joints);
+        Rig { joints, legs, order }
     }
 
     pub fn leg(&self, joint: usize) -> Option<&Leg> {
@@ -130,41 +176,58 @@ impl Rig {
         }
     }
 
-    pub fn parent_world(&self, joint: usize, worlds: &[Mat4; JOINT_COUNT]) -> Mat4 {
+    pub fn inside(&self, joint: usize, chosen: &BTreeSet<usize>) -> bool {
+        let mut at = self.joints[joint].parent;
+        for _ in 0..self.joints.len() {
+            match at {
+                Some(p) if chosen.contains(&p) => return true,
+                Some(p) => at = self.joints[p].parent,
+                None => return false,
+            }
+        }
+        false
+    }
+
+    pub fn parent_world(&self, joint: usize, worlds: &[Mat4]) -> Mat4 {
         match self.joints[joint].parent {
             Some(p) => worlds[p],
             None => root(),
         }
     }
 
-    pub fn worlds(&self, poses: &[Pose; JOINT_COUNT]) -> [Mat4; JOINT_COUNT] {
-        let mut worlds = [Mat4::IDENTITY; JOINT_COUNT];
-        for i in 0..JOINT_COUNT {
+    pub fn worlds(&self, poses: &[Pose]) -> Vec<Mat4> {
+        let mut worlds = vec![Mat4::IDENTITY; self.joints.len()];
+        for &i in &self.order {
             let j = &self.joints[i];
             worlds[i] = match self.leg(i) {
-                Some(leg) => leg.world(worlds[TORSO], poses[i]),
+                Some(leg) => leg.world(worlds[TORSO], poses[hip_of(i)].pos, poses[i]),
                 None => self.parent_world(i, &worlds) * j.c0 * poses[i].matrix() * j.c1.inverse(),
             };
         }
         worlds
     }
 
-    pub fn motors(&self, poses: &[Pose; JOINT_COUNT]) -> [Pose; JOINT_COUNT] {
+    pub fn motors(&self, poses: &[Pose]) -> Vec<Pose> {
         let worlds = self.worlds(poses);
-        std::array::from_fn(|i| match self.leg(i) {
-            Some(_) => self.pose_for_world(i, worlds[TORSO], worlds[i]),
-            None => poses[i],
-        })
+        (0..self.joints.len())
+            .map(|i| match self.leg(i) {
+                Some(_) => self.pose_for_world(i, worlds[TORSO], worlds[i]),
+                None => poses[i],
+            })
+            .collect()
     }
 
-    pub fn control(&self, joint: usize, poses: &[Pose; JOINT_COUNT], worlds: &[Mat4; JOINT_COUNT]) -> Mat4 {
+    pub fn control(&self, joint: usize, poses: &[Pose], worlds: &[Mat4]) -> Mat4 {
         match self.leg(joint) {
             Some(leg) => leg.target(poses[joint]),
             None => worlds[joint],
         }
     }
 
-    pub fn pivot(&self, joint: usize, poses: &[Pose; JOINT_COUNT], worlds: &[Mat4; JOINT_COUNT]) -> Vec3 {
+    pub fn pivot(&self, joint: usize, poses: &[Pose], worlds: &[Mat4]) -> Vec3 {
+        if joint == TORSO {
+            return worlds[TORSO].transform_point3(Vec3::new(0.0, TORSO_PIVOT, 0.0));
+        }
         let frame = match self.leg(joint) {
             Some(leg) => leg.target(poses[joint]),
             None => self.parent_world(joint, worlds) * self.joints[joint].c0 * poses[joint].matrix(),
@@ -172,9 +235,10 @@ impl Rig {
         frame.w_axis.truncate()
     }
 
-    pub fn pose_for_control(&self, joint: usize, worlds: &[Mat4; JOINT_COUNT], control: Mat4) -> Pose {
+    pub fn pose_for_control(&self, joint: usize, worlds: &[Mat4], control: Mat4) -> Pose {
         match self.leg(joint) {
             Some(leg) => leg.pose_for_target(control),
+            None if is_hip(joint) => Pose { rot: Quat::IDENTITY, ..self.pose_for_world(joint, self.parent_world(joint, worlds), control) },
             None => self.pose_for_world(joint, self.parent_world(joint, worlds), control),
         }
     }
@@ -189,6 +253,9 @@ impl Rig {
         if self.leg(joint).is_some() {
             return Pose::from_matrix(flip * pose.matrix() * flip);
         }
+        if joint >= JOINT_COUNT {
+            return pose;
+        }
         let from = &self.joints[joint];
         let relative = from.c0 * pose.matrix() * from.c1.inverse();
         let mirrored = flip * relative * flip;
@@ -200,6 +267,7 @@ impl Rig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::props::Shape;
 
     fn near(a: Vec3, b: Vec3) -> bool {
         (a - b).length() < 1e-4
@@ -246,5 +314,46 @@ mod tests {
         let left = posed[2].w_axis.truncate();
         let right = posed[3].w_axis.truncate();
         assert!(near(right, Vec3::new(-left.x, left.y, left.z)));
+    }
+
+    #[test]
+    fn torso_tilts_around_the_hip_line() {
+        let rig = Rig::r6();
+        let mut poses = [Pose::IDENTITY; JOINT_COUNT];
+        let worlds = rig.worlds(&poses);
+        let pivot = rig.pivot(TORSO, &poses, &worlds);
+        let tilt = Mat4::from_translation(pivot) * Mat4::from_rotation_x(0.6) * Mat4::from_translation(-pivot);
+        poses[TORSO] = rig.pose_for_control(TORSO, &worlds, tilt * rig.control(TORSO, &poses, &worlds));
+        let tilted = rig.worlds(&poses);
+        let drift = |joint: usize| (tilted[joint].w_axis - worlds[joint].w_axis).truncate().length();
+        assert!(drift(LEFT_HIP) < 0.2);
+        assert!(drift(1) > 1.0);
+    }
+
+    #[test]
+    fn hips_only_translate() {
+        let rig = Rig::r6();
+        let poses = [Pose::IDENTITY; JOINT_COUNT];
+        let worlds = rig.worlds(&poses);
+        let turned = Mat4::from_translation(Vec3::new(0.0, -0.2, 0.0)) * worlds[RIGHT_HIP] * Mat4::from_rotation_z(0.8);
+        let pose = rig.pose_for_control(RIGHT_HIP, &worlds, turned);
+        assert_eq!(pose.rot, Quat::IDENTITY);
+        assert!(near(pose.pos, Vec3::new(0.0, -0.2, 0.0)));
+    }
+
+    #[test]
+    fn props_follow_their_parent_even_when_listed_first() {
+        let mut blade = Prop::new("Blade".into(), Shape::Block(Vec3::ONE));
+        blade.parent = JOINT_COUNT + 1;
+        blade.rest = Pose { pos: Vec3::new(0.0, 2.0, 0.0), rot: Quat::IDENTITY };
+        let hilt = Prop::new("Hilt".into(), Shape::Block(Vec3::ONE));
+        let rig = Rig::new(&[blade, hilt]);
+        let mut poses = vec![Pose::IDENTITY; JOINT_COUNT + 2];
+        poses[RIGHT_ARM] = Pose { pos: Vec3::ZERO, rot: Quat::from_rotation_x(0.7) };
+        let worlds = rig.worlds(&poses);
+        let hand = worlds[RIGHT_ARM] * Mat4::from_translation(Vec3::new(0.0, -1.0, 0.0));
+        assert!(near(worlds[JOINT_COUNT + 1].w_axis.truncate(), hand.w_axis.truncate()));
+        let tip = hand * Mat4::from_translation(Vec3::new(0.0, 2.0, 0.0));
+        assert!(near(worlds[JOINT_COUNT].w_axis.truncate(), tip.w_axis.truncate()));
     }
 }

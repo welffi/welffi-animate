@@ -67,6 +67,71 @@ impl Point {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Extend {
+    #[default]
+    Constant,
+    Linear,
+    Cyclic,
+}
+
+impl Extend {
+    pub const ALL: [Extend; 3] = [Extend::Constant, Extend::Linear, Extend::Cyclic];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Extend::Constant => "Constant",
+            Extend::Linear => "Linear",
+            Extend::Cyclic => "Make Cyclic",
+        }
+    }
+}
+
+const PADDING: usize = 8;
+
+pub fn recalc_extended(points: &mut [Point], extend: Extend) {
+    let n = points.len();
+    if extend == Extend::Constant || n < 2 {
+        return recalc(points);
+    }
+    let (before, after) = match extend {
+        Extend::Cyclic => cyclic_padding(points),
+        _ => linear_padding(points),
+    };
+    let start = before.len();
+    let mut all = [before, points.to_vec(), after].concat();
+    recalc(&mut all);
+    points.copy_from_slice(&all[start..start + n]);
+}
+
+fn linear_padding(points: &[Point]) -> (Vec<Point>, Vec<Point>) {
+    let n = points.len();
+    let tail = |end: Point, neighbor: Point, step: usize| Point {
+        x: end.x + (end.x - neighbor.x) * step as f32,
+        y: end.y + (end.y - neighbor.y) * step as f32,
+        handle: Handle::Auto,
+        left: Vec2::ZERO,
+        right: Vec2::ZERO,
+    };
+    let before = (1..=PADDING).rev().map(|step| tail(points[0], points[1], step)).collect();
+    let after = (1..=PADDING).map(|step| tail(points[n - 1], points[n - 2], step)).collect();
+    (before, after)
+}
+
+fn cyclic_padding(points: &[Point]) -> (Vec<Point>, Vec<Point>) {
+    let ring = &points[..points.len() - 1];
+    let period = points[points.len() - 1].x - points[0].x;
+    let at = |i: isize| {
+        let count = ring.len() as isize;
+        let mut point = ring[i.rem_euclid(count) as usize];
+        point.x += i.div_euclid(count) as f32 * period;
+        point
+    };
+    let before = (1..=PADDING as isize).rev().map(|step| at(-step)).collect();
+    let after = (1..=PADDING as isize).map(|step| at(ring.len() as isize + step)).collect();
+    (before, after)
+}
+
 pub fn recalc(points: &mut [Point]) {
     let n = points.len();
     if n < 2 {
@@ -126,7 +191,7 @@ pub fn recalc(points: &mut [Point]) {
     }
 }
 
-fn slope(handle: Vec2) -> f64 {
+pub fn slope(handle: Vec2) -> f64 {
     let x = if handle.x.abs() < 1e-6 { 1e-6f32.copysign(handle.x) } else { handle.x };
     (handle.y / x) as f64
 }
@@ -289,6 +354,24 @@ mod tests {
         recalc(&mut p);
         assert_eq!(p[0].right, Vec2::new(10.0 / 3.0, 0.0));
         assert_eq!(p[1].left, Vec2::new(-10.0 / 3.0, 0.0));
+    }
+
+    #[test]
+    fn cyclic_ends_share_one_slope() {
+        let mut p = points(&[0.0, 10.0, 20.0, 30.0], &[0.0, 5.0, -2.0, 0.0], &[Handle::AutoClamped; 4]);
+        recalc_extended(&mut p, Extend::Cyclic);
+        let (start, end) = (slope(p[0].left), slope(p[3].right));
+        assert!(start.abs() > 0.05, "seam is flat: {start}");
+        assert!((start - end).abs() < 1e-3, "seam kinks: {start} vs {end}");
+        assert!((slope(p[0].right) - start).abs() < 1e-3);
+    }
+
+    #[test]
+    fn linear_ends_follow_the_line() {
+        let mut p = points(&[0.0, 10.0], &[0.0, 5.0], &[Handle::Auto; 2]);
+        recalc_extended(&mut p, Extend::Linear);
+        assert!((slope(p[0].left) - 0.5).abs() < 1e-3);
+        assert!((slope(p[1].right) - 0.5).abs() < 1e-3);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use crate::camera::Camera;
 use crate::editor::Editor;
-use crate::rig::{Pose, JOINT_COUNT};
+use crate::rig::Pose;
 use eframe::egui::{Pos2, Rect};
 use glam::{Mat4, Quat, Vec3};
 
@@ -46,10 +46,10 @@ pub struct Transform {
     pub typed: String,
     start_mouse: Pos2,
     center: Vec3,
-    start_worlds: [Mat4; JOINT_COUNT],
-    start_controls: [Mat4; JOINT_COUNT],
-    pivots: [Vec3; JOINT_COUNT],
-    start_overrides: [Option<Pose>; JOINT_COUNT],
+    start_worlds: Vec<Mat4>,
+    start_controls: Vec<Mat4>,
+    pivots: Vec<Vec3>,
+    start_overrides: Vec<Option<Pose>>,
     angle: f32,
     last_screen_angle: f32,
 }
@@ -62,8 +62,8 @@ impl Transform {
         }
         let poses = ed.poses();
         let worlds = ed.rig.worlds(&poses);
-        let pivots = std::array::from_fn(|j| ed.rig.pivot(j, &poses, &worlds));
-        let controls = std::array::from_fn(|j| ed.rig.control(j, &poses, &worlds));
+        let pivots = (0..poses.len()).map(|j| ed.rig.pivot(j, &poses, &worlds)).collect();
+        let controls = (0..poses.len()).map(|j| ed.rig.control(j, &poses, &worlds)).collect();
         let screen_angle = camera.project(rect, center).map_or(0.0, |c| screen_angle(c, mouse));
         Some(Transform {
             mode,
@@ -76,7 +76,7 @@ impl Transform {
             start_worlds: worlds,
             start_controls: controls,
             pivots,
-            start_overrides: ed.overrides,
+            start_overrides: ed.overrides.clone(),
             angle: 0.0,
             last_screen_angle: screen_angle,
         })
@@ -161,7 +161,7 @@ impl Transform {
 }
 
 fn top_level(ed: &Editor) -> Vec<usize> {
-    ed.parts.iter().copied().filter(|&j| ed.rig.joints[j].parent.is_none_or(|p| !ed.parts.contains(&p))).collect()
+    ed.parts.iter().copied().filter(|&j| !ed.rig.inside(j, &ed.parts)).collect()
 }
 
 fn snapped(angle: f32, snap: bool) -> f32 {

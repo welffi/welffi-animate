@@ -79,12 +79,15 @@ fn write_atomic(path: &Path, text: &str) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use crate::curve::Handle;
+    use crate::props::{Prop, Shape};
     use crate::rig::Pose;
 
     #[test]
     fn animation_survives_save_and_load() {
         let mut anim = Animation::default();
         anim.tracks[3].set(12, Pose::IDENTITY, Handle::AutoClamped);
+        let sword = anim.add_prop(Prop::new("Sword".into(), Shape::Obj("v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n".into())));
+        anim.tracks[sword].set(4, Pose::IDENTITY, Handle::AutoClamped);
         let path = std::env::temp_dir().join("welffi_animate_test.wanim");
         save_animation(&path, &anim).unwrap();
         assert_eq!(load_animation(&path).unwrap(), anim);

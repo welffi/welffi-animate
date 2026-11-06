@@ -1,4 +1,4 @@
-use crate::rig::{Rig, JOINT_COUNT};
+use crate::rig::{BODY_PARTS, JOINT_COUNT, MESH_COUNT};
 use eframe::egui;
 use eframe::egui_wgpu::{wgpu, RenderState};
 use glam::{Mat4, Vec3};
@@ -30,6 +30,7 @@ struct Uniforms {
     mvp: [[f32; 4]; 4],
     model: [[f32; 4]; 4],
     tint: [f32; 4],
+    color: [f32; 4],
 }
 
 pub struct PartMesh {
@@ -38,7 +39,7 @@ pub struct PartMesh {
     pub max: Vec3,
 }
 
-pub fn load_parts(bytes: &[u8], rig: &Rig) -> [PartMesh; JOINT_COUNT] {
+pub fn load_parts(bytes: &[u8]) -> Vec<PartMesh> {
     let mut found: Vec<(String, PartMesh)> = Vec::new();
     let mut at = 4;
     let read_u32 = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
@@ -58,10 +59,18 @@ pub fn load_parts(bytes: &[u8], rig: &Rig) -> [PartMesh; JOINT_COUNT] {
         });
         found.push((name, PartMesh { vertices, min, max }));
     }
-    rig.joints.each_ref().map(|joint| {
-        let i = found.iter().position(|(name, _)| name == joint.part).expect("rig mesh is missing a part");
+    let hidden = || PartMesh { vertices: Vec::new(), min: Vec3::ZERO, max: Vec3::ZERO };
+    let meshes = BODY_PARTS.iter().take(MESH_COUNT).map(|part| {
+        let i = found.iter().position(|(name, _)| name == part).expect("rig mesh is missing a part");
         found.swap_remove(i).1
-    })
+    });
+    meshes.chain((MESH_COUNT..JOINT_COUNT).map(|_| hidden())).collect()
+}
+
+pub struct Draw {
+    pub world: Mat4,
+    pub tint: [f32; 4],
+    pub color: [f32; 4],
 }
 
 struct Targets {
@@ -79,12 +88,14 @@ pub struct Scene3d {
     grid: (wgpu::Buffer, u32),
     grid_uniform: (wgpu::Buffer, wgpu::BindGroup),
     skin: wgpu::BindGroup,
+    plain: wgpu::BindGroup,
+    uniform_layout: wgpu::BindGroupLayout,
     targets: Option<Targets>,
     texture_id: Option<egui::TextureId>,
 }
 
 impl Scene3d {
-    pub fn new(rs: &RenderState, meshes: &[PartMesh; JOINT_COUNT], skin_png: &[u8]) -> Scene3d {
+    pub fn new(rs: &RenderState, meshes: &[PartMesh], skin_png: &[u8]) -> Scene3d {
         let device = &rs.device;
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("scene"),
@@ -151,33 +162,10 @@ impl Scene3d {
             wgpu::PrimitiveTopology::LineList,
         );
 
-        let parts = meshes
-            .iter()
-            .map(|m| {
-                let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("part"),
-                    contents: bytemuck::cast_slice(&m.vertices),
-                    usage: wgpu::BufferUsages::VERTEX,
-                });
-                (buffer, m.vertices.len() as u32)
-            })
-            .collect();
-        let make_uniform = || {
-            let buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("uniform"),
-                size: std::mem::size_of::<Uniforms>() as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("uniform"),
-                layout: &uniform_layout,
-                entries: &[wgpu::BindGroupEntry { binding: 0, resource: buffer.as_entire_binding() }],
-            });
-            (buffer, group)
-        };
-        let part_uniforms = (0..JOINT_COUNT).map(|_| make_uniform()).collect();
-        let grid_uniform = make_uniform();
+
+        let parts = meshes.iter().map(|m| vertex_buffer(device, m)).collect();
+        let part_uniforms = (0..JOINT_COUNT).map(|_| uniform(device, &uniform_layout)).collect();
+        let grid_uniform = uniform(device, &uniform_layout);
 
         let grid_lines = grid_vertices();
         let grid = (
@@ -189,40 +177,27 @@ impl Scene3d {
             grid_lines.len() as u32,
         );
 
-        let image = image::load_from_memory(skin_png).expect("rig texture").to_rgba8();
-        let texture = device.create_texture_with_data(
-            &rs.queue,
-            &wgpu::TextureDescriptor {
-                label: Some("skin"),
-                size: wgpu::Extent3d { width: image.width(), height: image.height(), depth_or_array_layers: 1 },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING,
-                view_formats: &[],
-            },
-            wgpu::util::TextureDataOrder::LayerMajor,
-            image.as_raw(),
-        );
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
-        let skin = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("skin"),
-            layout: &skin_layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&texture.create_view(&Default::default())) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) },
-            ],
-        });
+        let image = image::load_from_memory(skin_png).expect("rig texture").to_rgba8();
+        let skin = texture_group(rs, &skin_layout, &sampler, [image.width(), image.height()], image.as_raw());
+        let plain = texture_group(rs, &skin_layout, &sampler, [1, 1], &[255; 4]);
 
-        Scene3d { mesh_pipeline, line_pipeline, parts, part_uniforms, grid, grid_uniform, skin, targets: None, texture_id: None }
+        Scene3d { mesh_pipeline, line_pipeline, parts, part_uniforms, grid, grid_uniform, skin, plain, uniform_layout, targets: None, texture_id: None }
     }
 
-    pub fn render(&mut self, rs: &RenderState, size: [u32; 2], view_proj: Mat4, worlds: &[Mat4; JOINT_COUNT], tints: &[[f32; 4]; JOINT_COUNT]) -> egui::TextureId {
+    pub fn set_props(&mut self, rs: &RenderState, meshes: &[PartMesh]) {
+        self.parts.truncate(JOINT_COUNT);
+        self.parts.extend(meshes.iter().map(|m| vertex_buffer(&rs.device, m)));
+        while self.part_uniforms.len() < self.parts.len() {
+            self.part_uniforms.push(uniform(&rs.device, &self.uniform_layout));
+        }
+    }
+
+    pub fn render(&mut self, rs: &RenderState, size: [u32; 2], view_proj: Mat4, draws: &[Draw]) -> egui::TextureId {
         let size = [size[0].max(1), size[1].max(1)];
         if self.targets.as_ref().is_none_or(|t| t.size != size) {
             let targets = make_targets(&rs.device, size);
@@ -235,13 +210,13 @@ impl Scene3d {
         }
         let targets = self.targets.as_ref().unwrap();
 
-        let write = |buffer: &wgpu::Buffer, model: Mat4, tint: [f32; 4]| {
-            let u = Uniforms { mvp: (view_proj * model).to_cols_array_2d(), model: model.to_cols_array_2d(), tint };
+        let write = |buffer: &wgpu::Buffer, draw: &Draw| {
+            let u = Uniforms { mvp: (view_proj * draw.world).to_cols_array_2d(), model: draw.world.to_cols_array_2d(), tint: draw.tint, color: draw.color };
             rs.queue.write_buffer(buffer, 0, bytemuck::bytes_of(&u));
         };
-        write(&self.grid_uniform.0, Mat4::IDENTITY, [0.0; 4]);
-        for i in 0..JOINT_COUNT {
-            write(&self.part_uniforms[i].0, worlds[i], tints[i]);
+        write(&self.grid_uniform.0, &Draw { world: Mat4::IDENTITY, tint: [0.0; 4], color: [1.0; 4] });
+        for (draw, (buffer, _)) in draws.iter().zip(&self.part_uniforms) {
+            write(buffer, draw);
         }
 
         let mut encoder = rs.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("scene") });
@@ -262,8 +237,11 @@ impl Scene3d {
                 ..Default::default()
             });
             pass.set_pipeline(&self.mesh_pipeline);
-            pass.set_bind_group(1, &self.skin, &[]);
-            for ((buffer, count), (_, group)) in self.parts.iter().zip(&self.part_uniforms) {
+            for (i, (draw, ((buffer, count), (_, group)))) in draws.iter().zip(self.parts.iter().zip(&self.part_uniforms)).enumerate() {
+                if draw.color[3] == 0.0 || *count == 0 {
+                    continue;
+                }
+                pass.set_bind_group(1, if i < JOINT_COUNT { &self.skin } else { &self.plain }, &[]);
                 pass.set_bind_group(0, group, &[]);
                 pass.set_vertex_buffer(0, buffer.slice(..));
                 pass.draw(0..*count, 0..1);
@@ -276,6 +254,56 @@ impl Scene3d {
         rs.queue.submit([encoder.finish()]);
         self.texture_id.unwrap()
     }
+}
+
+fn vertex_buffer(device: &wgpu::Device, mesh: &PartMesh) -> (wgpu::Buffer, u32) {
+    let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("part"),
+        contents: bytemuck::cast_slice(&mesh.vertices),
+        usage: wgpu::BufferUsages::VERTEX,
+    });
+    (buffer, mesh.vertices.len() as u32)
+}
+
+fn uniform(device: &wgpu::Device, layout: &wgpu::BindGroupLayout) -> (wgpu::Buffer, wgpu::BindGroup) {
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("uniform"),
+        size: std::mem::size_of::<Uniforms>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("uniform"),
+        layout,
+        entries: &[wgpu::BindGroupEntry { binding: 0, resource: buffer.as_entire_binding() }],
+    });
+    (buffer, group)
+}
+
+fn texture_group(rs: &RenderState, layout: &wgpu::BindGroupLayout, sampler: &wgpu::Sampler, size: [u32; 2], pixels: &[u8]) -> wgpu::BindGroup {
+    let texture = rs.device.create_texture_with_data(
+        &rs.queue,
+        &wgpu::TextureDescriptor {
+            label: Some("texture"),
+            size: wgpu::Extent3d { width: size[0], height: size[1], depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        },
+        wgpu::util::TextureDataOrder::LayerMajor,
+        pixels,
+    );
+    rs.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("texture"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&texture.create_view(&Default::default())) },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
+        ],
+    })
 }
 
 fn pipeline(

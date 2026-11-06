@@ -1,7 +1,8 @@
 use crate::camera::Camera;
 use crate::editor::Editor;
-use crate::render::{PartMesh, Scene3d};
-use crate::rig::{JOINT_COUNT, LEFT_LEG, RIGHT_LEG};
+use crate::props::{linear_color, mesh, Shape};
+use crate::render::{Draw, PartMesh, Scene3d};
+use crate::rig::{is_hip, JOINT_COUNT, LEFT_HIP, LEFT_LEG, RIGHT_HIP, RIGHT_LEG};
 use crate::transform::{Axis, Mode, Transform};
 use eframe::egui::{self, Color32, Event, Key, PointerButton, Pos2, Rect, Sense, Stroke, Vec2};
 use eframe::egui_wgpu::RenderState;
@@ -20,17 +21,49 @@ pub struct Viewport {
     pub camera: Camera,
     pub local: bool,
     scene: Scene3d,
-    bounds: [(Vec3, Vec3); JOINT_COUNT],
+    bounds: Vec<(Vec3, Vec3)>,
+    shapes: Vec<Shape>,
     transform: Option<Transform>,
     swallow_click: bool,
     pub hovered: bool,
 }
 
 impl Viewport {
-    pub fn new(rs: &RenderState, meshes: [PartMesh; JOINT_COUNT], skin_png: &[u8]) -> Viewport {
+    pub fn new(rs: &RenderState, meshes: Vec<PartMesh>, skin_png: &[u8]) -> Viewport {
         let scene = Scene3d::new(rs, &meshes, skin_png);
-        let bounds = meshes.each_ref().map(|m| (m.min, m.max));
-        Viewport { camera: Camera::default(), local: true, scene, bounds, transform: None, swallow_click: false, hovered: false }
+        let bounds = meshes.iter().map(|m| (m.min, m.max)).collect();
+        Viewport { camera: Camera::default(), local: true, scene, bounds, shapes: Vec::new(), transform: None, swallow_click: false, hovered: false }
+    }
+
+    fn sync_props(&mut self, rs: &RenderState, ed: &Editor) {
+        if self.shapes.iter().eq(ed.anim.props.iter().map(|p| &p.shape)) {
+            return;
+        }
+        let meshes: Vec<PartMesh> = ed.anim.props.iter().map(|p| mesh(&p.shape)).collect();
+        self.scene.set_props(rs, &meshes);
+        self.bounds.truncate(JOINT_COUNT);
+        self.bounds.extend(meshes.iter().map(|m| (m.min, m.max)));
+        self.shapes = ed.anim.props.iter().map(|p| p.shape.clone()).collect();
+    }
+
+    fn draws(&self, ed: &Editor, worlds: &[Mat4], hovered_part: Option<usize>) -> Vec<Draw> {
+        let tint = |j: usize| {
+            if ed.active == Some(j) && ed.parts.contains(&j) {
+                ACTIVE_TINT
+            } else if ed.parts.contains(&j) {
+                SELECTED_TINT
+            } else if hovered_part == Some(j) {
+                HOVER_TINT
+            } else {
+                [0.0; 4]
+            }
+        };
+        let color = |j: usize| match j.checked_sub(JOINT_COUNT).map(|k| &ed.anim.props[k]) {
+            None => [1.0; 4],
+            Some(prop) if prop.hidden => [0.0; 4],
+            Some(prop) => linear_color(prop.color),
+        };
+        worlds.iter().enumerate().map(|(j, &world)| Draw { world, tint: tint(j), color: color(j) }).collect()
     }
 
     pub fn busy(&self) -> bool {
@@ -77,20 +110,11 @@ impl Viewport {
             worlds = ed.rig.worlds(&poses);
         }
 
-        let tints: [[f32; 4]; JOINT_COUNT] = std::array::from_fn(|j| {
-            if ed.active == Some(j) && ed.parts.contains(&j) {
-                ACTIVE_TINT
-            } else if ed.parts.contains(&j) {
-                SELECTED_TINT
-            } else if hovered_part == Some(j) {
-                HOVER_TINT
-            } else {
-                [0.0; 4]
-            }
-        });
+        self.sync_props(rs, ed);
+        let draws = self.draws(ed, &worlds, hovered_part);
         let ppp = ui.ctx().pixels_per_point();
         let size = [(rect.width() * ppp).round() as u32, (rect.height() * ppp).round() as u32];
-        let texture = self.scene.render(rs, size, self.camera.view_proj(rect), &worlds, &tints);
+        let texture = self.scene.render(rs, size, self.camera.view_proj(rect), &draws);
         let painter = ui.painter_at(rect);
         painter.image(texture, rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
         if self.transform.is_none() {
@@ -173,7 +197,7 @@ impl Viewport {
                     ed.active = None;
                 }
                 Key::A => {
-                    ed.parts = (0..JOINT_COUNT).collect();
+                    ed.parts = (0..ed.anim.tracks.len()).collect();
                     ed.active = ed.active.or(Some(0));
                 }
                 Key::L => self.local = !self.local,
@@ -255,19 +279,22 @@ impl Viewport {
         }
     }
 
-    fn foot_targets(&self, ed: &Editor, rect: Rect) -> Vec<(usize, Pos2)> {
+    fn handles(&self, ed: &Editor, rect: Rect) -> Vec<(usize, Pos2)> {
         let poses = ed.poses();
         let worlds = ed.rig.worlds(&poses);
-        [LEFT_LEG, RIGHT_LEG].into_iter().filter_map(|j| Some((j, self.camera.project(rect, ed.rig.pivot(j, &poses, &worlds))?))).collect()
+        [LEFT_LEG, RIGHT_LEG, LEFT_HIP, RIGHT_HIP].into_iter().filter_map(|j| Some((j, self.camera.project(rect, ed.rig.pivot(j, &poses, &worlds))?))).collect()
     }
 
-    fn pick(&self, rect: Rect, pos: Pos2, ed: &Editor, worlds: &[Mat4; JOINT_COUNT]) -> Option<usize> {
-        if let Some((j, _)) = self.foot_targets(ed, rect).into_iter().find(|(_, p)| p.distance(pos) < FOOT_TARGET_SIZE + 3.0) {
+    fn pick(&self, rect: Rect, pos: Pos2, ed: &Editor, worlds: &[Mat4]) -> Option<usize> {
+        if let Some((j, _)) = self.handles(ed, rect).into_iter().find(|(_, p)| p.distance(pos) < FOOT_TARGET_SIZE + 3.0) {
             return Some(j);
         }
         let (origin, dir) = self.camera.ray(rect, pos);
         let mut best: Option<(f32, usize)> = None;
-        for (j, world) in worlds.iter().enumerate() {
+        for (j, world) in worlds.iter().enumerate().take(self.bounds.len()) {
+            if is_hip(j) || j >= JOINT_COUNT && ed.anim.props[j - JOINT_COUNT].hidden {
+                continue;
+            }
             let inverse = world.inverse();
             let o = inverse.transform_point3(origin);
             let d = inverse.transform_vector3(dir);
@@ -308,12 +335,18 @@ impl Viewport {
     }
 
     fn overlay(&self, painter: &egui::Painter, rect: Rect, ed: &Editor) {
-        for (j, p) in self.foot_targets(ed, rect) {
+        for (j, p) in self.handles(ed, rect) {
+            let selected = ed.parts.contains(&j);
+            let outline = Stroke::new(1.5, Color32::from_gray(230));
+            if is_hip(j) {
+                painter.circle(p, FOOT_TARGET_SIZE, if selected { Color32::from_rgb(255, 160, 50) } else { Color32::TRANSPARENT }, outline);
+                continue;
+            }
             let square = Rect::from_center_size(p, Vec2::splat(FOOT_TARGET_SIZE * 2.0));
-            if ed.parts.contains(&j) {
+            if selected {
                 painter.rect_filled(square, 1.0, Color32::from_rgb(255, 160, 50));
             }
-            painter.rect_stroke(square, 1.0, Stroke::new(1.5, Color32::from_gray(230)), egui::StrokeKind::Middle);
+            painter.rect_stroke(square, 1.0, outline, egui::StrokeKind::Middle);
         }
         let text = if self.local { "Local  (L)" } else { "Global  (L)" };
         painter.text(rect.left_top() + Vec2::new(10.0, 8.0), egui::Align2::LEFT_TOP, text, egui::FontId::proportional(13.0), Color32::from_gray(170));

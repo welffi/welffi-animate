@@ -1,12 +1,13 @@
 use eframe::egui::{Align2, Color32, CornerRadius, FontId, Painter, Pos2, Rect, Stroke, StrokeKind, Vec2};
 
-const HINTS: [(&str, &str); 10] = [
+const HINTS: [(&str, &str); 11] = [
     ("R", "Rotate"),
     ("G", "Move"),
     ("I", "Key"),
     ("Space", "Play"),
     ("T", "Easing"),
     ("V", "Handles"),
+    ("Shift+E", "Loop / extend"),
     ("B", "Build-up"),
     ("F", "Body follow"),
     ("Ctrl+Tab", "Graph"),

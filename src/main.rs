@@ -21,6 +21,8 @@ mod step_panel;
 mod steps;
 mod nametags;
 mod project;
+mod props;
+mod props_panel;
 mod render;
 mod rig;
 mod timeline;

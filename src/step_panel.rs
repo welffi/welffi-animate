@@ -1,6 +1,5 @@
 use crate::editor::Editor;
 use crate::live::{Choice, Live};
-use crate::rig::JOINT_COUNT;
 use crate::steps::step_animation;
 use eframe::egui::{self, Pos2, RichText};
 use std::collections::BTreeSet;
@@ -28,7 +27,7 @@ impl StepPanel {
     }
 
     pub fn open(&mut self, ed: &mut Editor, at: Pos2) {
-        let tracks = if ed.parts.is_empty() { (0..JOINT_COUNT).collect() } else { ed.parts.clone() };
+        let tracks = if ed.parts.is_empty() { (0..ed.anim.tracks.len()).collect() } else { ed.parts.clone() };
         self.open = Some(Open { live: Live::start(ed, at), tracks, keys: 0 });
         self.preview(ed);
     }
@@ -50,7 +49,7 @@ impl StepPanel {
         let mut changed = false;
         let hold = &mut self.hold;
         let fps = ed.anim.fps;
-        let parts = if open.tracks.len() == JOINT_COUNT { "All parts".to_string() } else { open.tracks.iter().map(|&t| ed.rig.joints[t].part).collect::<Vec<_>>().join(", ") };
+        let parts = if open.tracks.len() == ed.anim.tracks.len() { "All parts".to_string() } else { open.tracks.iter().map(|&t| ed.rig.joints[t].part.as_str()).collect::<Vec<_>>().join(", ") };
         let choice = open.live.window(ctx, "Low FPS look", |ui| {
             changed |= ui
                 .add(egui::Slider::new(hold, 2..=12).text("Hold").custom_formatter(|v, _| format!("{v} frames")))

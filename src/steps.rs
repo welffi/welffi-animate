@@ -12,7 +12,7 @@ pub fn stepped(track: &Track, hold: i32, handle: Handle) -> Track {
     if first.frame == last.frame {
         return track.clone();
     }
-    let mut out = Track::default();
+    let mut out = Track { extend: track.extend, ..Track::default() };
     for frame in step_frames(first.frame, last.frame, hold) {
         out.set(frame, track.sample(frame as f32), handle);
     }

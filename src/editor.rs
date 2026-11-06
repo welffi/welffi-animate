@@ -1,6 +1,6 @@
 use crate::anim::{Animation, KeyId};
 use crate::curve::Handle;
-use crate::rig::{Pose, Rig, JOINT_COUNT};
+use crate::rig::{Pose, Rig};
 use std::collections::BTreeSet;
 
 const UNDO_LIMIT: usize = 200;
@@ -16,10 +16,10 @@ pub struct Editor {
     pub parts: BTreeSet<usize>,
     pub active: Option<usize>,
     pub keys: BTreeSet<KeyId>,
-    pub overrides: [Option<Pose>; JOINT_COUNT],
+    pub overrides: Vec<Option<Pose>>,
     pub status: String,
     pub changes: u64,
-    copied: [Option<Pose>; JOINT_COUNT],
+    copied: Vec<Option<Pose>>,
     undo: Vec<Animation>,
     redo: Vec<Animation>,
 }
@@ -27,7 +27,8 @@ pub struct Editor {
 impl Editor {
     pub fn new(anim: Animation) -> Editor {
         Editor {
-            rig: Rig::r6(),
+            rig: Rig::new(&anim.props),
+            overrides: vec![None; anim.tracks.len()],
             anim,
             frame: 0.0,
             playing: false,
@@ -37,10 +38,9 @@ impl Editor {
             parts: BTreeSet::new(),
             active: None,
             keys: BTreeSet::new(),
-            overrides: [None; JOINT_COUNT],
             status: String::new(),
             changes: 0,
-            copied: [None; JOINT_COUNT],
+            copied: Vec::new(),
             undo: Vec::new(),
             redo: Vec::new(),
         }
@@ -50,10 +50,10 @@ impl Editor {
         self.frame.round() as i32
     }
 
-    pub fn poses(&self) -> [Pose; JOINT_COUNT] {
+    pub fn poses(&self) -> Vec<Pose> {
         let mut poses = self.anim.poses(self.frame);
-        for (pose, over) in poses.iter_mut().zip(self.overrides) {
-            if let Some(over) = over {
+        for (pose, over) in poses.iter_mut().zip(&self.overrides) {
+            if let Some(over) = *over {
                 *pose = over;
             }
         }
@@ -63,8 +63,22 @@ impl Editor {
     pub fn set_frame(&mut self, frame: f32) {
         if frame != self.frame {
             self.frame = frame;
-            self.overrides = [None; JOINT_COUNT];
+            self.clear_overrides();
         }
+    }
+
+    fn clear_overrides(&mut self) {
+        self.overrides.iter_mut().for_each(|o| *o = None);
+    }
+
+    pub fn props_changed(&mut self) {
+        self.rig = Rig::new(&self.anim.props);
+        let count = self.anim.tracks.len();
+        self.overrides = vec![None; count];
+        self.copied.resize(count, None);
+        self.parts.retain(|&j| j < count);
+        self.active = self.active.filter(|&j| j < count);
+        self.keys.retain(|&(j, _)| j < count);
     }
 
     pub fn checkpoint(&mut self) {
@@ -91,9 +105,9 @@ impl Editor {
     }
 
     fn after_history(&mut self, what: &str) {
+        self.props_changed();
         let all = self.anim.all_keys();
         self.keys.retain(|k| all.contains(k));
-        self.overrides = [None; JOINT_COUNT];
         self.changes += 1;
         self.status = what.to_string();
     }
@@ -103,7 +117,7 @@ impl Editor {
         self.undo.clear();
         self.redo.clear();
         self.keys.clear();
-        self.overrides = [None; JOINT_COUNT];
+        self.props_changed();
         self.frame = 0.0;
         self.playing = false;
         self.changes += 1;
@@ -116,7 +130,7 @@ impl Editor {
     }
 
     pub fn insert_keys(&mut self) {
-        let joints: Vec<usize> = if self.parts.is_empty() { (0..JOINT_COUNT).collect() } else { self.parts.iter().copied().collect() };
+        let joints: Vec<usize> = if self.parts.is_empty() { (0..self.anim.tracks.len()).collect() } else { self.parts.iter().copied().collect() };
         self.key_joints(&joints);
         self.status = format!("Keyed {} part{} at frame {}", joints.len(), if joints.len() == 1 { "" } else { "s" }, self.current());
     }
@@ -149,7 +163,7 @@ impl Editor {
 
     pub fn copy_pose(&mut self) {
         let poses = self.poses();
-        self.copied = [None; JOINT_COUNT];
+        self.copied = vec![None; poses.len()];
         for &j in &self.parts {
             self.copied[j] = Some(poses[j]);
         }

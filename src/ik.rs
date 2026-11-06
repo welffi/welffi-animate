@@ -3,7 +3,7 @@ use glam::{Mat3, Mat4, Vec3};
 
 const THIGH: f32 = 0.7071;
 const SHIN: f32 = 1.1985;
-const HIP_HEIGHT: f32 = -1.002;
+pub const HIP_HEIGHT: f32 = -1.002;
 const FOOT_HEIGHT: f32 = 0.093;
 const POLE: Vec3 = Vec3::new(0.0, -0.029, -0.465);
 
@@ -29,7 +29,7 @@ impl Leg {
             rest_shin: Mat3::IDENTITY,
             rest_end: Vec3::ZERO,
         };
-        let rest = leg.solve(rest_torso, leg.target(Pose::IDENTITY));
+        let rest = leg.solve(rest_torso, Vec3::ZERO, leg.target(Pose::IDENTITY));
         leg.rest_shin = rest.shin;
         leg.rest_end = rest.end;
         leg
@@ -44,14 +44,14 @@ impl Leg {
         Pose { pos: pose.pos - self.rest_foot, rot: pose.rot }
     }
 
-    pub fn world(&self, torso: Mat4, pose: Pose) -> Mat4 {
-        let chain = self.solve(torso, self.target(pose));
+    pub fn world(&self, torso: Mat4, hip_shift: Vec3, pose: Pose) -> Mat4 {
+        let chain = self.solve(torso, hip_shift, self.target(pose));
         let turn = Mat4::from_mat3(chain.shin * self.rest_shin.transpose());
         Mat4::from_translation(chain.end) * turn * Mat4::from_translation(-self.rest_end) * self.rest_world
     }
 
-    fn solve(&self, torso: Mat4, target: Mat4) -> Chain {
-        let hip = torso.transform_point3(self.hip);
+    fn solve(&self, torso: Mat4, hip_shift: Vec3, target: Mat4) -> Chain {
+        let hip = torso.transform_point3(self.hip + hip_shift);
         let pole = target.transform_point3(POLE);
         let to = target.w_axis.truncate() - hip;
         let dir = to.try_normalize().unwrap_or(Vec3::NEG_Y);
@@ -69,7 +69,7 @@ impl Leg {
 
 #[cfg(test)]
 mod tests {
-    use crate::rig::{Pose, Rig, JOINT_COUNT};
+    use crate::rig::{Pose, Rig, JOINT_COUNT, LEFT_HIP, LEFT_LEG};
     use glam::Vec3;
 
     fn hip_point(lift: f32) -> Vec3 {
@@ -83,6 +83,19 @@ mod tests {
     #[test]
     fn rest_target_keeps_leg_at_rest() {
         assert!((hip_point(0.0) - Vec3::new(-1.0, 2.0, 0.0)).length() < 1e-4);
+    }
+
+    #[test]
+    fn moving_the_hip_leaves_the_foot_planted() {
+        let rig = Rig::r6();
+        let rest = rig.worlds(&[Pose::IDENTITY; JOINT_COUNT]);
+        let foot = Vec3::new(-0.5, 0.093, 0.0);
+        let on_leg = rest[LEFT_LEG].inverse().transform_point3(foot);
+        let mut poses = [Pose::IDENTITY; JOINT_COUNT];
+        poses[LEFT_HIP].pos = Vec3::new(0.2, -0.3, 0.1);
+        let worlds = rig.worlds(&poses);
+        assert!((worlds[LEFT_LEG].transform_point3(on_leg) - foot).length() < 0.02);
+        assert!((worlds[LEFT_LEG].w_axis - rest[LEFT_LEG].w_axis).truncate().length() > 0.1);
     }
 
     #[test]

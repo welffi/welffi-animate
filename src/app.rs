@@ -4,8 +4,8 @@ use crate::export::roblox_clipboard;
 use crate::panels::{Panels, Tool};
 use crate::curve::Handle;
 use crate::project::{load_animation, load_session, load_settings, save_animation, save_session, save_settings, Session, Settings};
+use crate::props_panel::PropsPanel;
 use crate::render::load_parts;
-use crate::rig::Rig;
 use crate::timeline::Timeline;
 use crate::viewport::Viewport;
 use eframe::egui::{self, Event, Key, Modifiers, RichText};
@@ -20,6 +20,7 @@ pub struct App {
     viewport: Viewport,
     timeline: Timeline,
     panels: Panels,
+    props: PropsPanel,
     autosaved: u64,
     file_saved: u64,
     last_autosave: Instant,
@@ -29,7 +30,7 @@ pub struct App {
 impl App {
     pub fn new(cc: &eframe::CreationContext) -> App {
         let rs = cc.wgpu_render_state.as_ref().expect("welffi animate needs the wgpu renderer");
-        let meshes = load_parts(include_bytes!("../assets/r6.bin"), &Rig::r6());
+        let meshes = load_parts(include_bytes!("../assets/r6.bin"));
         let viewport = Viewport::new(rs, meshes, include_bytes!("../assets/r6.png"));
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
         let session = load_session();
@@ -43,6 +44,7 @@ impl App {
             viewport,
             timeline: Timeline::default(),
             panels: Panels::default(),
+            props: PropsPanel::default(),
             autosaved: 0,
             file_saved: 0,
             last_autosave: Instant::now(),
@@ -108,6 +110,9 @@ impl App {
                     self.set_key_names(names);
                 }
             });
+            if ui.selectable_label(self.props.open, "Props").on_hover_text("Add items the character holds, like a sword").clicked() {
+                self.props.open = !self.props.open;
+            }
             ui.separator();
             if ui.button(RichText::new("Copy for Roblox").strong()).on_hover_text("Ctrl+Shift+C. Paste the text into the Roblox animation importer plugin.").clicked() {
                 self.export(ui.ctx());
@@ -260,7 +265,7 @@ impl App {
     }
 
     fn new_file(&mut self) {
-        self.ed.replace(Animation::default());
+        self.ed.replace(Animation::fresh());
         self.path = None;
         self.file_saved = self.ed.changes;
         self.ed.status = "New animation".to_string();
@@ -354,6 +359,7 @@ impl eframe::App for App {
         });
 
         self.panels.ui(&ctx, &mut self.ed);
+        self.props.ui(&ctx, &mut self.ed);
         if self.viewport.busy() || self.timeline.busy() {
             ctx.request_repaint();
         }

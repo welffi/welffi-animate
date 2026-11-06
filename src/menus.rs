@@ -1,4 +1,4 @@
-use crate::curve::Handle;
+use crate::curve::{Extend, Handle};
 use crate::easing::{Ease, Interp};
 use crate::editor::Editor;
 use eframe::egui::{self, Key, Pos2, RichText};
@@ -7,6 +7,7 @@ use eframe::egui::{self, Key, Pos2, RichText};
 pub enum MenuKind {
     Interp,
     Handle,
+    Extend,
 }
 
 pub struct Menu {
@@ -28,6 +29,7 @@ pub fn show(ui: &egui::Ui, ed: &mut Editor, menu: &mut Option<Menu>) {
             chosen = match kind {
                 MenuKind::Interp => interp_items(ui, ed),
                 MenuKind::Handle => handle_items(ui, ed),
+                MenuKind::Extend => extend_items(ui, ed),
             };
         });
     });
@@ -53,6 +55,22 @@ fn interp_items(ui: &mut egui::Ui, ed: &mut Editor) -> bool {
         if ui.button(ease.name()).clicked() {
             ed.checkpoint();
             ed.anim.set_ease(&ed.keys, ease);
+            chosen = true;
+        }
+    }
+    chosen
+}
+
+fn extend_items(ui: &mut egui::Ui, ed: &mut Editor) -> bool {
+    let mut chosen = false;
+    let current: Vec<Extend> = ed.keys.iter().map(|&(track, _)| ed.anim.tracks[track].extend).collect();
+    ui.label(RichText::new("Extrapolation").weak());
+    for extend in Extend::ALL {
+        let all_this = current.iter().all(|&e| e == extend);
+        if ui.selectable_label(all_this, extend.name()).clicked() {
+            ed.checkpoint();
+            let tracks = ed.anim.set_extend(&ed.keys, extend);
+            ed.status = format!("Set {} tracks to {}", tracks, extend.name());
             chosen = true;
         }
     }

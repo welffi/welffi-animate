@@ -1,6 +1,7 @@
-use crate::curve::{self, Handle, Point, Side};
+use crate::curve::{self, Extend, Handle, Point, Side};
 use crate::easing::{eased, Ease, Interp};
-use crate::rig::{Pose, JOINT_COUNT};
+use crate::props::Prop;
+use crate::rig::{Pose, JOINT_COUNT, MESH_COUNT};
 use glam::Vec2;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -30,6 +31,8 @@ impl Key {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Track {
     pub keys: Vec<Key>,
+    #[serde(default)]
+    pub extend: Extend,
 }
 
 pub type KeyId = (usize, i32);
@@ -62,7 +65,36 @@ impl Track {
         self.keys.last().filter(|_| self.span(frame).is_none())
     }
 
+    fn looped(&self, frame: f32) -> f32 {
+        let (Some(first), Some(last)) = (self.keys.first(), self.keys.last()) else { return frame };
+        let (start, end) = (first.frame as f32, last.frame as f32);
+        if self.extend != Extend::Cyclic || start == end || (start..=end).contains(&frame) {
+            return frame;
+        }
+        start + (frame - start).rem_euclid(end - start)
+    }
+
+    fn runs_on(&self, frame: f32) -> bool {
+        let (Some(first), Some(last)) = (self.keys.first(), self.keys.last()) else { return false };
+        self.extend == Extend::Linear && self.keys.len() > 1 && (frame < first.frame as f32 || frame > last.frame as f32)
+    }
+
+    fn end_slope(&self, channel: usize, front: bool) -> f32 {
+        let n = self.keys.len();
+        let (from, to) = if front { (&self.keys[0], &self.keys[1]) } else { (&self.keys[n - 2], &self.keys[n - 1]) };
+        match from.interp {
+            Interp::Constant => 0.0,
+            Interp::Bezier if front => curve::slope(from.left[channel]) as f32,
+            Interp::Bezier => curve::slope(to.right[channel]) as f32,
+            _ => (to.pose.channels()[channel] - from.pose.channels()[channel]) / (to.frame - from.frame) as f32,
+        }
+    }
+
     pub fn sample(&self, frame: f32) -> Pose {
+        let frame = self.looped(frame);
+        if self.runs_on(frame) {
+            return Pose::from_channels(std::array::from_fn(|c| self.channel(c, frame)));
+        }
         let Some((i, t)) = self.span(frame) else {
             return self.edge(frame).map_or(Pose::IDENTITY, |k| k.pose.normalized());
         };
@@ -75,6 +107,12 @@ impl Track {
     }
 
     pub fn channel(&self, channel: usize, frame: f32) -> f32 {
+        let frame = self.looped(frame);
+        if self.runs_on(frame) {
+            let front = frame < self.keys[0].frame as f32;
+            let end = if front { &self.keys[0] } else { &self.keys[self.keys.len() - 1] };
+            return end.pose.channels()[channel] + self.end_slope(channel, front) * (frame - end.frame as f32);
+        }
         let Some((i, t)) = self.span(frame) else {
             return self.edge(frame).map_or(Pose::IDENTITY.channels()[channel], |k| k.pose.channels()[channel]);
         };
@@ -89,7 +127,7 @@ impl Track {
     pub fn recalc(&mut self) {
         for channel in 0..CHANNELS {
             let mut points: Vec<Point> = self.keys.iter().map(|k| k.point(channel)).collect();
-            curve::recalc(&mut points);
+            curve::recalc_extended(&mut points, self.extend);
             for (key, point) in self.keys.iter_mut().zip(points) {
                 key.left[channel] = point.left;
                 key.right[channel] = point.right;
@@ -124,18 +162,60 @@ impl Track {
 pub struct Animation {
     pub fps: u32,
     pub end: i32,
-    pub tracks: [Track; JOINT_COUNT],
+    pub tracks: Vec<Track>,
+    #[serde(default)]
+    pub props: Vec<Prop>,
 }
 
 impl Default for Animation {
     fn default() -> Self {
-        Animation { fps: 60, end: 60, tracks: Default::default() }
+        Animation { fps: 60, end: 60, tracks: vec![Track::default(); JOINT_COUNT], props: Vec::new() }
     }
 }
 
 impl Animation {
-    pub fn poses(&self, frame: f32) -> [Pose; JOINT_COUNT] {
-        std::array::from_fn(|i| self.tracks[i].sample(frame))
+    pub fn fresh() -> Animation {
+        let mut anim = Animation::default();
+        for track in &mut anim.tracks {
+            track.set(0, Pose::IDENTITY, Handle::AutoClamped);
+        }
+        anim
+    }
+
+    pub fn poses(&self, frame: f32) -> Vec<Pose> {
+        self.tracks.iter().map(|t| t.sample(frame)).collect()
+    }
+
+    pub fn add_prop(&mut self, prop: Prop) -> usize {
+        self.props.push(prop);
+        self.tracks.push(Track::default());
+        self.tracks.len() - 1
+    }
+
+    pub fn remove_prop(&mut self, k: usize) {
+        let joint = JOINT_COUNT + k;
+        let removed = self.props.remove(k);
+        self.tracks.remove(joint);
+        for prop in &mut self.props {
+            if prop.parent == joint {
+                prop.parent = removed.parent;
+                prop.rest = Pose::from_matrix(removed.rest.matrix() * prop.rest.matrix());
+            }
+            if prop.parent > joint {
+                prop.parent -= 1;
+            }
+        }
+    }
+
+    pub fn bake_rest(&mut self, k: usize, pose: Pose) {
+        let prop = &mut self.props[k];
+        prop.rest = Pose::from_matrix(prop.rest.matrix() * pose.matrix());
+        let inverse = pose.matrix().inverse();
+        let track = &mut self.tracks[JOINT_COUNT + k];
+        for key in &mut track.keys {
+            key.pose = Pose::from_matrix(inverse * key.pose.matrix());
+        }
+        track.recalc();
     }
 
     pub fn key_frames(&self) -> BTreeSet<i32> {
@@ -195,7 +275,32 @@ impl Animation {
         self.recalc();
     }
 
+    pub fn set_extend(&mut self, keys: &BTreeSet<KeyId>, extend: Extend) -> usize {
+        let mut changed = 0;
+        for (i, track) in self.tracks.iter_mut().enumerate() {
+            if keys.iter().any(|&(joint, _)| joint == i) {
+                track.extend = extend;
+                track.recalc();
+                changed += 1;
+            }
+        }
+        changed
+    }
+
+    fn add_hip_tracks(&mut self) {
+        if self.tracks.len() != MESH_COUNT + self.props.len() {
+            return;
+        }
+        let hips = JOINT_COUNT - MESH_COUNT;
+        self.tracks.splice(MESH_COUNT..MESH_COUNT, vec![Track::default(); hips]);
+        for prop in self.props.iter_mut().filter(|p| p.parent >= MESH_COUNT) {
+            prop.parent += hips;
+        }
+    }
+
     pub fn recalc(&mut self) {
+        self.add_hip_tracks();
+        self.tracks.resize(JOINT_COUNT + self.props.len(), Track::default());
         self.tracks.iter_mut().for_each(Track::recalc);
     }
 
@@ -262,6 +367,113 @@ mod tests {
         assert_eq!(moved, BTreeSet::from([(2, 1, 13)]));
         let key = anim.tracks[2].key_at(13).unwrap();
         assert_eq!((key.pose.pos.x, key.pose.pos.y), (1.0, 0.5));
+    }
+
+    fn looping_track(extend: Extend) -> Track {
+        let mut track = Track::default();
+        track.set(0, pose_x(0.0), Handle::AutoClamped);
+        track.set(10, pose_x(4.0), Handle::AutoClamped);
+        track.set(20, pose_x(0.0), Handle::AutoClamped);
+        track.extend = extend;
+        track.recalc();
+        track
+    }
+
+    #[test]
+    fn cyclic_repeats_the_motion_both_ways() {
+        let track = looping_track(Extend::Cyclic);
+        for frame in [3.0, 12.5, 17.0] {
+            let inside = track.sample(frame).pos.x;
+            assert!((track.sample(frame + 20.0).pos.x - inside).abs() < 1e-4);
+            assert!((track.sample(frame - 40.0).pos.x - inside).abs() < 1e-4);
+            assert!((track.channel(0, frame + 60.0) - inside).abs() < 1e-4);
+        }
+    }
+
+    #[test]
+    fn constant_holds_past_the_ends_and_linear_runs_on() {
+        let constant = looping_track(Extend::Constant);
+        assert_eq!(constant.sample(35.0).pos.x, 0.0);
+        let mut line = Track::default();
+        line.set(0, pose_x(0.0), Handle::Auto);
+        line.set(10, pose_x(5.0), Handle::Auto);
+        line.extend = Extend::Linear;
+        line.recalc();
+        assert!((line.sample(20.0).pos.x - 10.0).abs() < 0.05);
+        assert!((line.sample(-10.0).pos.x + 5.0).abs() < 0.05);
+    }
+
+    #[test]
+    fn extend_is_set_on_the_tracks_of_the_chosen_keys() {
+        let mut anim = Animation::default();
+        anim.tracks[1].set(0, pose_x(0.0), Handle::AutoClamped);
+        anim.tracks[1].set(10, pose_x(1.0), Handle::AutoClamped);
+        anim.tracks[2].set(0, pose_x(0.0), Handle::AutoClamped);
+        assert_eq!(anim.set_extend(&BTreeSet::from([(1, 10)]), Extend::Cyclic), 1);
+        assert_eq!(anim.tracks[1].extend, Extend::Cyclic);
+        assert_eq!(anim.tracks[2].extend, Extend::Constant);
+    }
+
+    #[test]
+    fn a_fresh_animation_keys_every_part_at_zero() {
+        let anim = Animation::fresh();
+        assert!(anim.tracks.iter().all(|t| t.keys.len() == 1 && t.key_at(0).is_some()));
+    }
+
+    fn block(name: &str) -> Prop {
+        Prop::new(name.into(), crate::props::Shape::Block(Vec3::ONE))
+    }
+
+    fn near(a: glam::Mat4, b: glam::Mat4) -> bool {
+        a.abs_diff_eq(b, 1e-4)
+    }
+
+    #[test]
+    fn placing_a_prop_keeps_how_its_keys_look() {
+        let mut anim = Animation::default();
+        let sword = anim.add_prop(block("Sword"));
+        let turned = Pose { pos: Vec3::new(0.0, 0.5, 0.0), rot: Quat::from_rotation_x(0.7) };
+        anim.tracks[sword].set(0, turned, Handle::AutoClamped);
+        anim.tracks[sword].set(10, pose_x(1.0), Handle::AutoClamped);
+        let rest = anim.props[0].rest.matrix();
+        let before = [0.0, 10.0].map(|f| rest * anim.poses(f)[sword].matrix());
+        anim.bake_rest(0, turned);
+        let rest = anim.props[0].rest.matrix();
+        let after = [0.0, 10.0].map(|f| rest * anim.poses(f)[sword].matrix());
+        assert!(near(before[0], after[0]) && near(before[1], after[1]));
+        assert!(near(anim.poses(0.0)[sword].matrix(), glam::Mat4::IDENTITY));
+    }
+
+    #[test]
+    fn removing_a_prop_hands_its_children_to_its_parent() {
+        let mut anim = Animation::default();
+        anim.add_prop(block("Hilt"));
+        anim.add_prop(block("Sword"));
+        let blade = anim.add_prop(block("Blade"));
+        anim.props[2].parent = JOINT_COUNT + 1;
+        anim.props[2].rest = pose_x(2.0);
+        anim.tracks[blade].set(3, Pose::IDENTITY, Handle::AutoClamped);
+        let world = anim.props[1].rest.matrix() * anim.props[2].rest.matrix();
+        anim.remove_prop(1);
+        assert_eq!(anim.tracks.len(), JOINT_COUNT + 2);
+        assert_eq!(anim.props[1].parent, crate::rig::RIGHT_ARM);
+        assert!(near(anim.props[1].rest.matrix(), world));
+        assert!(anim.tracks[JOINT_COUNT + 1].key_at(3).is_some());
+    }
+
+    #[test]
+    fn old_files_get_hip_tracks_and_props_keep_their_parents() {
+        let mut anim = Animation::default();
+        anim.add_prop(block("Hilt"));
+        anim.add_prop(block("Blade"));
+        anim.tracks[JOINT_COUNT].set(5, Pose::IDENTITY, Handle::AutoClamped);
+        anim.tracks.drain(MESH_COUNT..JOINT_COUNT);
+        anim.props[1].parent = MESH_COUNT;
+        anim.recalc();
+        assert_eq!(anim.tracks.len(), JOINT_COUNT + 2);
+        assert!(anim.tracks[JOINT_COUNT].key_at(5).is_some());
+        assert_eq!(anim.props[1].parent, JOINT_COUNT);
+        assert_eq!(anim.props[0].parent, crate::rig::RIGHT_ARM);
     }
 
     #[test]
