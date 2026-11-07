@@ -1,5 +1,7 @@
 use crate::curve::{self, Extend, Handle, Point, Side};
 use crate::easing::{eased, Ease, Interp};
+use crate::rigs::Stand;
+use crate::markers::Marker;
 use crate::props::Prop;
 use crate::rig::{Pose, JOINT_COUNT, MESH_COUNT};
 use glam::Vec2;
@@ -165,11 +167,19 @@ pub struct Animation {
     pub tracks: Vec<Track>,
     #[serde(default)]
     pub props: Vec<Prop>,
+    #[serde(default)]
+    pub markers: Vec<Marker>,
+    #[serde(default)]
+    pub partner: Option<Box<Animation>>,
+    #[serde(default)]
+    pub at: Stand,
+    #[serde(default)]
+    pub second: bool,
 }
 
 impl Default for Animation {
     fn default() -> Self {
-        Animation { fps: 60, end: 60, tracks: vec![Track::default(); JOINT_COUNT], props: Vec::new() }
+        Animation { fps: 60, end: 60, tracks: vec![Track::default(); JOINT_COUNT], props: Vec::new(), markers: Vec::new(), partner: None, at: Stand::default(), second: false }
     }
 }
 
@@ -302,6 +312,7 @@ impl Animation {
         self.add_hip_tracks();
         self.tracks.resize(JOINT_COUNT + self.props.len(), Track::default());
         self.tracks.iter_mut().for_each(Track::recalc);
+        self.sync_partner();
     }
 
     fn each_key(&mut self, keys: &BTreeSet<KeyId>, mut f: impl FnMut(&mut Key)) {

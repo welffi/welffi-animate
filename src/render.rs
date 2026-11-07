@@ -67,6 +67,12 @@ pub fn load_parts(bytes: &[u8]) -> Vec<PartMesh> {
     meshes.chain((MESH_COUNT..JOINT_COUNT).map(|_| hidden())).collect()
 }
 
+struct Part {
+    buffer: wgpu::Buffer,
+    count: u32,
+    skinned: bool,
+}
+
 pub struct Draw {
     pub world: Mat4,
     pub tint: [f32; 4],
@@ -83,15 +89,30 @@ struct Targets {
 pub struct Scene3d {
     mesh_pipeline: wgpu::RenderPipeline,
     line_pipeline: wgpu::RenderPipeline,
-    parts: Vec<(wgpu::Buffer, u32)>,
+    body: Vec<(wgpu::Buffer, u32)>,
+    parts: Vec<Part>,
     part_uniforms: Vec<(wgpu::Buffer, wgpu::BindGroup)>,
     grid: (wgpu::Buffer, u32),
     grid_uniform: (wgpu::Buffer, wgpu::BindGroup),
     skin: wgpu::BindGroup,
     plain: wgpu::BindGroup,
     uniform_layout: wgpu::BindGroupLayout,
+    surface: Surface,
+}
+
+#[derive(Default)]
+pub struct Surface {
     targets: Option<Targets>,
     texture_id: Option<egui::TextureId>,
+}
+
+impl Surface {
+    pub fn free(&mut self, rs: &RenderState) {
+        if let Some(id) = self.texture_id.take() {
+            rs.renderer.write().free_texture(&id);
+        }
+        self.targets = None;
+    }
 }
 
 impl Scene3d {
@@ -163,7 +184,7 @@ impl Scene3d {
         );
 
 
-        let parts = meshes.iter().map(|m| vertex_buffer(device, m)).collect();
+        let body: Vec<(wgpu::Buffer, u32)> = meshes.iter().map(|m| vertex_buffer(device, m)).collect();
         let part_uniforms = (0..JOINT_COUNT).map(|_| uniform(device, &uniform_layout)).collect();
         let grid_uniform = uniform(device, &uniform_layout);
 
@@ -186,29 +207,45 @@ impl Scene3d {
         let skin = texture_group(rs, &skin_layout, &sampler, [image.width(), image.height()], image.as_raw());
         let plain = texture_group(rs, &skin_layout, &sampler, [1, 1], &[255; 4]);
 
-        Scene3d { mesh_pipeline, line_pipeline, parts, part_uniforms, grid, grid_uniform, skin, plain, uniform_layout, targets: None, texture_id: None }
+        let mut scene = Scene3d { mesh_pipeline, line_pipeline, body, parts: Vec::new(), part_uniforms, grid, grid_uniform, skin, plain, uniform_layout, surface: Surface::default() };
+        scene.set_actors(rs, &[Vec::new()]);
+        scene
     }
 
-    pub fn set_props(&mut self, rs: &RenderState, meshes: &[PartMesh]) {
-        self.parts.truncate(JOINT_COUNT);
-        self.parts.extend(meshes.iter().map(|m| vertex_buffer(&rs.device, m)));
+    pub fn set_actors(&mut self, rs: &RenderState, props: &[Vec<PartMesh>]) {
+        self.parts.clear();
+        for meshes in props {
+            let body = self.body.iter().map(|(buffer, count)| Part { buffer: buffer.clone(), count: *count, skinned: true });
+            self.parts.extend(body);
+            for mesh in meshes {
+                let (buffer, count) = vertex_buffer(&rs.device, mesh);
+                self.parts.push(Part { buffer, count, skinned: false });
+            }
+        }
         while self.part_uniforms.len() < self.parts.len() {
             self.part_uniforms.push(uniform(&rs.device, &self.uniform_layout));
         }
     }
 
     pub fn render(&mut self, rs: &RenderState, size: [u32; 2], view_proj: Mat4, draws: &[Draw]) -> egui::TextureId {
+        let mut surface = std::mem::take(&mut self.surface);
+        let id = self.render_to(rs, &mut surface, size, view_proj, draws);
+        self.surface = surface;
+        id
+    }
+
+    pub fn render_to(&self, rs: &RenderState, surface: &mut Surface, size: [u32; 2], view_proj: Mat4, draws: &[Draw]) -> egui::TextureId {
         let size = [size[0].max(1), size[1].max(1)];
-        if self.targets.as_ref().is_none_or(|t| t.size != size) {
+        if surface.targets.as_ref().is_none_or(|t| t.size != size) {
             let targets = make_targets(&rs.device, size);
             let mut renderer = rs.renderer.write();
-            match self.texture_id {
+            match surface.texture_id {
                 Some(id) => renderer.update_egui_texture_from_wgpu_texture(&rs.device, &targets.resolve, wgpu::FilterMode::Linear, id),
-                None => self.texture_id = Some(renderer.register_native_texture(&rs.device, &targets.resolve, wgpu::FilterMode::Linear)),
+                None => surface.texture_id = Some(renderer.register_native_texture(&rs.device, &targets.resolve, wgpu::FilterMode::Linear)),
             }
-            self.targets = Some(targets);
+            surface.targets = Some(targets);
         }
-        let targets = self.targets.as_ref().unwrap();
+        let targets = surface.targets.as_ref().unwrap();
 
         let write = |buffer: &wgpu::Buffer, draw: &Draw| {
             let u = Uniforms { mvp: (view_proj * draw.world).to_cols_array_2d(), model: draw.world.to_cols_array_2d(), tint: draw.tint, color: draw.color };
@@ -237,14 +274,14 @@ impl Scene3d {
                 ..Default::default()
             });
             pass.set_pipeline(&self.mesh_pipeline);
-            for (i, (draw, ((buffer, count), (_, group)))) in draws.iter().zip(self.parts.iter().zip(&self.part_uniforms)).enumerate() {
-                if draw.color[3] == 0.0 || *count == 0 {
+            for (draw, (part, (_, group))) in draws.iter().zip(self.parts.iter().zip(&self.part_uniforms)) {
+                if draw.color[3] == 0.0 || part.count == 0 {
                     continue;
                 }
-                pass.set_bind_group(1, if i < JOINT_COUNT { &self.skin } else { &self.plain }, &[]);
+                pass.set_bind_group(1, if part.skinned { &self.skin } else { &self.plain }, &[]);
                 pass.set_bind_group(0, group, &[]);
-                pass.set_vertex_buffer(0, buffer.slice(..));
-                pass.draw(0..*count, 0..1);
+                pass.set_vertex_buffer(0, part.buffer.slice(..));
+                pass.draw(0..part.count, 0..1);
             }
             pass.set_pipeline(&self.line_pipeline);
             pass.set_bind_group(0, &self.grid_uniform.1, &[]);
@@ -252,7 +289,7 @@ impl Scene3d {
             pass.draw(0..self.grid.1, 0..1);
         }
         rs.queue.submit([encoder.finish()]);
-        self.texture_id.unwrap()
+        surface.texture_id.unwrap()
     }
 }
 

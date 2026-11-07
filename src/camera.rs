@@ -1,3 +1,4 @@
+use crate::rigs::Stand;
 use eframe::egui::{Pos2, Rect, Vec2};
 use glam::{Mat4, Vec3, Vec4Swizzles};
 use std::f32::consts::{FRAC_PI_2, PI};
@@ -80,5 +81,35 @@ impl Camera {
     pub fn look_from(&mut self, yaw: f32, pitch: f32) {
         self.yaw = yaw;
         self.pitch = pitch.clamp(-FRAC_PI_2 + 0.01, FRAC_PI_2 - 0.01);
+    }
+}
+
+impl Camera {
+    pub fn carry(&mut self, by: Stand) {
+        self.target = by.matrix().transform_point3(self.target);
+        self.yaw += by.turn;
+    }
+}
+
+pub fn ray_box(origin: Vec3, dir: Vec3, min: Vec3, max: Vec3) -> Option<f32> {
+    let inv = dir.recip();
+    let t1 = (min - origin) * inv;
+    let t2 = (max - origin) * inv;
+    let near = t1.min(t2).max_element();
+    let far = t1.max(t2).min_element();
+    (far >= near.max(0.0)).then_some(near.max(0.0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn carrying_the_camera_keeps_its_view_of_the_scene() {
+        let mut camera = Camera { target: Vec3::new(1.0, 2.0, -3.0), yaw: 0.7, pitch: 0.2, distance: 9.0 };
+        let by = Stand { x: 2.0, z: -4.0, turn: 2.2 };
+        let eye = by.matrix().transform_point3(camera.eye());
+        camera.carry(by);
+        assert!(camera.eye().abs_diff_eq(eye, 1e-4));
     }
 }

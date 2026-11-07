@@ -19,8 +19,12 @@ pub struct Panels {
 }
 
 impl Panels {
+    pub fn busy(&self) -> bool {
+        self.moves.is_open() || self.steps.is_open() || self.body.is_open()
+    }
+
     pub fn open(&mut self, tool: Tool, ctx: &egui::Context, ed: &mut Editor) {
-        if self.moves.is_open() || self.steps.is_open() || self.body.is_open() {
+        if self.busy() {
             return;
         }
         let at = ctx.input(|i| i.pointer.hover_pos()).unwrap_or(ctx.content_rect().center());

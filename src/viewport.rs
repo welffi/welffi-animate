@@ -1,6 +1,8 @@
-use crate::camera::Camera;
+use crate::camera::{ray_box, Camera};
 use crate::editor::Editor;
-use crate::props::{linear_color, mesh, Shape};
+use crate::gizmo::{Gizmo, RING_RADIUS};
+use crate::partner;
+use crate::props::{mesh, part_color, Shape};
 use crate::render::{Draw, PartMesh, Scene3d};
 use crate::rig::{is_hip, JOINT_COUNT, LEFT_HIP, LEFT_LEG, RIGHT_HIP, RIGHT_LEG};
 use crate::transform::{Axis, Mode, Transform};
@@ -9,9 +11,6 @@ use eframe::egui_wgpu::RenderState;
 use glam::{Mat4, Vec3};
 use std::f32::consts::{FRAC_PI_2, PI, TAU};
 
-const RING_RADIUS: f32 = 80.0;
-const VIEW_RING_RADIUS: f32 = 96.0;
-const AXIS_COLORS: [Color32; 3] = [Color32::from_rgb(232, 64, 80), Color32::from_rgb(120, 200, 40), Color32::from_rgb(60, 130, 240)];
 const SELECTED_TINT: [f32; 4] = [1.0, 0.55, 0.12, 0.22];
 const ACTIVE_TINT: [f32; 4] = [1.0, 0.62, 0.2, 0.32];
 const HOVER_TINT: [f32; 4] = [1.0, 1.0, 1.0, 0.08];
@@ -21,32 +20,58 @@ pub struct Viewport {
     pub camera: Camera,
     pub local: bool,
     scene: Scene3d,
-    bounds: Vec<(Vec3, Vec3)>,
-    shapes: Vec<Shape>,
+    body_bounds: Vec<(Vec3, Vec3)>,
+    bounds: Vec<Vec<(Vec3, Vec3)>>,
+    shapes: Vec<Vec<Shape>>,
     transform: Option<Transform>,
     swallow_click: bool,
+    switch_next: bool,
     pub hovered: bool,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Hit {
+    Part(usize),
+    Rig,
 }
 
 impl Viewport {
     pub fn new(rs: &RenderState, meshes: Vec<PartMesh>, skin_png: &[u8]) -> Viewport {
         let scene = Scene3d::new(rs, &meshes, skin_png);
-        let bounds = meshes.iter().map(|m| (m.min, m.max)).collect();
-        Viewport { camera: Camera::default(), local: true, scene, bounds, shapes: Vec::new(), transform: None, swallow_click: false, hovered: false }
+        let body_bounds: Vec<(Vec3, Vec3)> = meshes.iter().map(|m| (m.min, m.max)).collect();
+        let bounds = vec![body_bounds.clone()];
+        Viewport { camera: Camera::default(), local: true, scene, body_bounds, bounds, shapes: Vec::new(), transform: None, swallow_click: false, switch_next: false, hovered: false }
     }
 
     fn sync_props(&mut self, rs: &RenderState, ed: &Editor) {
-        if self.shapes.iter().eq(ed.anim.props.iter().map(|p| &p.shape)) {
+        let actors: Vec<&[crate::props::Prop]> = std::iter::once(ed.anim.props.as_slice()).chain(ed.anim.partner.as_ref().map(|p| p.props.as_slice())).collect();
+        let shapes: Vec<Vec<Shape>> = actors.iter().map(|props| props.iter().map(|p| p.shape.clone()).collect()).collect();
+        if self.shapes == shapes {
             return;
         }
-        let meshes: Vec<PartMesh> = ed.anim.props.iter().map(|p| mesh(&p.shape)).collect();
-        self.scene.set_props(rs, &meshes);
-        self.bounds.truncate(JOINT_COUNT);
-        self.bounds.extend(meshes.iter().map(|m| (m.min, m.max)));
-        self.shapes = ed.anim.props.iter().map(|p| p.shape.clone()).collect();
+        let meshes: Vec<Vec<PartMesh>> = actors.iter().map(|props| props.iter().map(|p| mesh(&p.shape)).collect()).collect();
+        self.scene.set_actors(rs, &meshes);
+        self.bounds = meshes.iter().map(|actor| self.body_bounds.iter().copied().chain(actor.iter().map(|m| (m.min, m.max))).collect()).collect();
+        self.shapes = shapes;
     }
 
-    fn draws(&self, ed: &Editor, worlds: &[Mat4], hovered_part: Option<usize>) -> Vec<Draw> {
+    pub fn frame_pair(&mut self) {
+        self.camera.target = Vec3::new(0.0, 2.6, -2.0);
+        self.camera.distance = 16.0;
+        self.camera.look_from(FRAC_PI_2 + 0.3, 0.2);
+    }
+
+    pub fn switch_rig(&mut self, ed: &mut Editor) {
+        if let Some(stand) = ed.switch_rig() {
+            self.camera.carry(stand);
+        }
+    }
+
+    fn draws(&self, ed: &Editor, worlds: &[Mat4], hit: Option<Hit>) -> Vec<Draw> {
+        let hovered_part = match hit {
+            Some(Hit::Part(j)) => Some(j),
+            _ => None,
+        };
         let tint = |j: usize| {
             if ed.active == Some(j) && ed.parts.contains(&j) {
                 ACTIVE_TINT
@@ -58,12 +83,9 @@ impl Viewport {
                 [0.0; 4]
             }
         };
-        let color = |j: usize| match j.checked_sub(JOINT_COUNT).map(|k| &ed.anim.props[k]) {
-            None => [1.0; 4],
-            Some(prop) if prop.hidden => [0.0; 4],
-            Some(prop) => linear_color(prop.color),
-        };
-        worlds.iter().enumerate().map(|(j, &world)| Draw { world, tint: tint(j), color: color(j) }).collect()
+        let mut draws: Vec<Draw> = worlds.iter().enumerate().map(|(j, &world)| Draw { world, tint: tint(j), color: part_color(&ed.anim.props, j) }).collect();
+        draws.extend(partner::draws(ed, hit == Some(Hit::Rig)));
+        draws
     }
 
     pub fn busy(&self) -> bool {
@@ -80,7 +102,12 @@ impl Viewport {
 
         let mut poses = ed.poses();
         let mut worlds = ed.rig.worlds(&poses);
-        let hovered_part = pointer.filter(|p| rect.contains(*p) && self.transform.is_none()).and_then(|p| self.pick(rect, p, ed, &worlds));
+        self.sync_props(rs, ed);
+        let hit = pointer.filter(|p| rect.contains(*p) && self.transform.is_none()).and_then(|p| self.pick(rect, p, ed, &worlds));
+        let hovered_part = match hit {
+            Some(Hit::Part(j)) => Some(j),
+            _ => None,
+        };
 
         if self.transform.is_some() {
             self.run_transform(ui, rect, ed);
@@ -96,7 +123,11 @@ impl Viewport {
                 }
             }
             if response.clicked() && ring.is_none_or(|axis| axis == Axis::Trackball) && !self.swallow_click {
-                self.click_select(ui, ed, hovered_part);
+                if hit == Some(Hit::Rig) {
+                    self.switch_next = true;
+                } else {
+                    self.click_select(ui, ed, hovered_part);
+                }
             }
             if !ui.input(|i| i.pointer.any_down()) {
                 self.swallow_click = false;
@@ -110,8 +141,7 @@ impl Viewport {
             worlds = ed.rig.worlds(&poses);
         }
 
-        self.sync_props(rs, ed);
-        let draws = self.draws(ed, &worlds, hovered_part);
+        let draws = self.draws(ed, &worlds, hit);
         let ppp = ui.ctx().pixels_per_point();
         let size = [(rect.width() * ppp).round() as u32, (rect.height() * ppp).round() as u32];
         let texture = self.scene.render(rs, size, self.camera.view_proj(rect), &draws);
@@ -124,6 +154,9 @@ impl Viewport {
             }
         }
         self.overlay(&painter, rect, ed);
+        if std::mem::take(&mut self.switch_next) {
+            self.switch_rig(ed);
+        }
     }
 
     fn navigate(&mut self, ui: &egui::Ui, response: &egui::Response, rect: Rect) {
@@ -201,6 +234,7 @@ impl Viewport {
                     ed.active = ed.active.or(Some(0));
                 }
                 Key::L => self.local = !self.local,
+                Key::Tab => self.switch_next = ed.anim.partner.is_some(),
                 Key::Num1 | Key::Num3 | Key::Num7 => self.view_key(key, ui.input(|i| i.modifiers.ctrl)),
                 Key::Home => {
                     self.camera.target = Vec3::new(0.0, 2.6, 0.0);
@@ -285,26 +319,37 @@ impl Viewport {
         [LEFT_LEG, RIGHT_LEG, LEFT_HIP, RIGHT_HIP].into_iter().filter_map(|j| Some((j, self.camera.project(rect, ed.rig.pivot(j, &poses, &worlds))?))).collect()
     }
 
-    fn pick(&self, rect: Rect, pos: Pos2, ed: &Editor, worlds: &[Mat4]) -> Option<usize> {
+    fn pick(&self, rect: Rect, pos: Pos2, ed: &Editor, worlds: &[Mat4]) -> Option<Hit> {
         if let Some((j, _)) = self.handles(ed, rect).into_iter().find(|(_, p)| p.distance(pos) < FOOT_TARGET_SIZE + 3.0) {
-            return Some(j);
+            return Some(Hit::Part(j));
         }
+        let own = self.nearest_part(rect, pos, ed, worlds);
+        let other = self.bounds.get(1).and_then(|bounds| partner::nearest(&self.camera, rect, pos, ed, bounds));
+        match (own, other) {
+            (Some((near, _)), Some(far)) if far < near => Some(Hit::Rig),
+            (Some((_, j)), _) => Some(Hit::Part(j)),
+            (None, Some(_)) => Some(Hit::Rig),
+            (None, None) => None,
+        }
+    }
+
+    fn nearest_part(&self, rect: Rect, pos: Pos2, ed: &Editor, worlds: &[Mat4]) -> Option<(f32, usize)> {
         let (origin, dir) = self.camera.ray(rect, pos);
         let mut best: Option<(f32, usize)> = None;
-        for (j, world) in worlds.iter().enumerate().take(self.bounds.len()) {
+        for (j, (world, (min, max))) in worlds.iter().zip(&self.bounds[0]).enumerate() {
             if is_hip(j) || j >= JOINT_COUNT && ed.anim.props[j - JOINT_COUNT].hidden {
                 continue;
             }
             let inverse = world.inverse();
             let o = inverse.transform_point3(origin);
             let d = inverse.transform_vector3(dir);
-            if let Some(t) = ray_box(o, d, self.bounds[j].0, self.bounds[j].1) {
+            if let Some(t) = ray_box(o, d, *min, *max) {
                 if best.is_none_or(|(b, _)| t < b) {
                     best = Some((t, j));
                 }
             }
         }
-        best.map(|(_, j)| j)
+        best
     }
 
     fn gizmo(&self, ed: &Editor, rect: Rect) -> Option<Gizmo> {
@@ -350,75 +395,12 @@ impl Viewport {
         }
         let text = if self.local { "Local  (L)" } else { "Global  (L)" };
         painter.text(rect.left_top() + Vec2::new(10.0, 8.0), egui::Align2::LEFT_TOP, text, egui::FontId::proportional(13.0), Color32::from_gray(170));
+        if ed.anim.partner.is_some() {
+            let who = format!("Editing Rig {}  (Tab or click to switch)", if ed.anim.second { 2 } else { 1 });
+            painter.text(rect.center_top() + Vec2::new(0.0, 8.0), egui::Align2::CENTER_TOP, who, egui::FontId::proportional(13.0), Color32::from_rgb(255, 160, 50));
+        }
         let frame = format!("Frame {}", ed.current());
         painter.text(rect.right_top() + Vec2::new(-10.0, 8.0), egui::Align2::RIGHT_TOP, frame, egui::FontId::proportional(13.0), Color32::from_gray(170));
         crate::hints::paint(painter, rect);
     }
-}
-
-struct Gizmo {
-    center: Vec3,
-    screen_center: Pos2,
-    rings: [Vec<(Pos2, bool)>; 3],
-    local: bool,
-}
-
-impl Gizmo {
-    fn ring_at(&self, p: Pos2) -> Option<Axis> {
-        let mut best: Option<(f32, usize)> = None;
-        for (i, ring) in self.rings.iter().enumerate() {
-            for w in ring.windows(2) {
-                if !(w[0].1 && w[1].1) {
-                    continue;
-                }
-                let d = segment_distance(p, w[0].0, w[1].0);
-                if d < 7.0 && best.is_none_or(|(b, _)| d < b) {
-                    best = Some((d, i));
-                }
-            }
-        }
-        if let Some((_, i)) = best {
-            return Some(if self.local { Axis::Local(i) } else { Axis::Global(i) });
-        }
-        let distance = p.distance(self.screen_center);
-        if (distance - VIEW_RING_RADIUS).abs() < 6.0 {
-            Some(Axis::View)
-        } else {
-            (distance < RING_RADIUS).then_some(Axis::Trackball)
-        }
-    }
-
-    fn draw(&self, painter: egui::Painter, hovered: Option<Axis>) {
-        if hovered == Some(Axis::Trackball) {
-            painter.circle_filled(self.screen_center, RING_RADIUS, Color32::from_white_alpha(18));
-        }
-        let view_hot = hovered == Some(Axis::View);
-        painter.circle_stroke(self.screen_center, VIEW_RING_RADIUS, Stroke::new(if view_hot { 3.0 } else { 1.5 }, Color32::from_gray(if view_hot { 255 } else { 200 })));
-        for (i, ring) in self.rings.iter().enumerate() {
-            let hot = matches!(hovered, Some(Axis::Local(j)) | Some(Axis::Global(j)) if j == i);
-            let color = if hot { AXIS_COLORS[i].gamma_multiply(1.3) } else { AXIS_COLORS[i] };
-            let stroke = Stroke::new(if hot { 3.5 } else { 2.0 }, color);
-            for w in ring.windows(2) {
-                if w[0].1 && w[1].1 {
-                    painter.line_segment([w[0].0, w[1].0], stroke);
-                }
-            }
-        }
-        painter.circle_filled(self.screen_center, 2.5, Color32::WHITE);
-    }
-}
-
-fn segment_distance(p: Pos2, a: Pos2, b: Pos2) -> f32 {
-    let ab = b - a;
-    let t = if ab.length_sq() > 0.0 { ((p - a).dot(ab) / ab.length_sq()).clamp(0.0, 1.0) } else { 0.0 };
-    p.distance(a + ab * t)
-}
-
-fn ray_box(origin: Vec3, dir: Vec3, min: Vec3, max: Vec3) -> Option<f32> {
-    let inv = dir.recip();
-    let t1 = (min - origin) * inv;
-    let t2 = (max - origin) * inv;
-    let near = t1.min(t2).max_element();
-    let far = t1.max(t2).min_element();
-    (far >= near.max(0.0)).then_some(near.max(0.0))
 }

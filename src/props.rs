@@ -162,6 +162,14 @@ pub fn linear_color(color: [u8; 3]) -> [f32; 4] {
     [c(color[0]), c(color[1]), c(color[2]), 1.0]
 }
 
+pub fn part_color(props: &[Prop], joint: usize) -> [f32; 4] {
+    match joint.checked_sub(JOINT_COUNT).map(|k| &props[k]) {
+        None => [1.0; 4],
+        Some(prop) if prop.hidden => [0.0; 4],
+        Some(prop) => linear_color(prop.color),
+    }
+}
+
 pub fn unique_name(props: &[Prop], wanted: &str, skip: Option<usize>) -> String {
     let base = wanted.trim();
     let base = if base.is_empty() { "Prop" } else { base };

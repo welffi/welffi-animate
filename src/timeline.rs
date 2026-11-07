@@ -2,6 +2,7 @@ use crate::anim::KeyId;
 use crate::easing::Interp;
 use crate::editor::Editor;
 use crate::graph::Graph;
+use crate::marker_lane::MarkerLane;
 use crate::menus::{self, Menu, MenuKind};
 use crate::nametags;
 use eframe::egui::{self, Align2, Color32, CornerRadius, Event, FontId, Key, Modifiers, PointerButton, Pos2, Rect, Sense, Shape, Stroke, StrokeKind, Vec2};
@@ -9,6 +10,7 @@ use std::collections::BTreeSet;
 
 const NAME_WIDTH: f32 = 96.0;
 const RULER_HEIGHT: f32 = 24.0;
+const MARKER_LANE: f32 = 20.0;
 pub const ROW_HEIGHT: f32 = 22.0;
 pub const KEY_RADIUS: f32 = 6.0;
 pub const SELECTED_KEY: Color32 = Color32::from_rgb(255, 160, 40);
@@ -27,12 +29,23 @@ pub struct Timeline {
     menu: Option<Menu>,
     graph: Graph,
     graph_mode: bool,
+    markers: MarkerLane,
     pub hovered: bool,
 }
 
 impl Default for Timeline {
     fn default() -> Self {
-        Timeline { start: -4.0, pixels_per_frame: 10.0, drag: None, scrubbing: false, menu: None, graph: Graph::default(), graph_mode: false, hovered: false }
+        Timeline {
+            start: -4.0,
+            pixels_per_frame: 10.0,
+            drag: None,
+            scrubbing: false,
+            menu: None,
+            graph: Graph::default(),
+            graph_mode: false,
+            markers: MarkerLane::default(),
+            hovered: false,
+        }
     }
 }
 
@@ -54,7 +67,11 @@ impl Layout {
     }
 
     pub fn body_top(&self) -> f32 {
-        self.rect.top() + RULER_HEIGHT
+        self.rect.top() + RULER_HEIGHT + MARKER_LANE
+    }
+
+    pub fn lane(&self) -> Rect {
+        Rect::from_min_max(Pos2::new(self.keys_left, self.rect.top() + RULER_HEIGHT), Pos2::new(self.rect.right(), self.body_top()))
     }
 
     pub fn body(&self) -> Rect {
@@ -73,7 +90,7 @@ impl Layout {
 
 impl Timeline {
     pub fn busy(&self) -> bool {
-        self.drag.is_some() || self.scrubbing || self.graph.busy()
+        self.drag.is_some() || self.scrubbing || self.graph.busy() || self.markers.busy()
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui, ed: &mut Editor) {
@@ -96,6 +113,7 @@ impl Timeline {
                 nametags::paint(ui, &layout, ed, at);
             }
         }
+        self.markers.ui(ui, &layout, ed);
         paint_playhead(ui, &layout, ed);
         self.mode_switch(ui, &layout);
         if !ui.ctx().egui_wants_keyboard_input() {
@@ -156,7 +174,7 @@ impl Timeline {
     }
 
     fn scrub(&mut self, ui: &egui::Ui, response: &egui::Response, layout: &Layout, ed: &mut Editor) {
-        let in_ruler = |p: Pos2| p.y < layout.body_top() && p.x >= layout.keys_left;
+        let in_ruler = |p: Pos2| p.y < layout.rect.top() + RULER_HEIGHT && p.x >= layout.keys_left;
         if response.drag_started_by(PointerButton::Primary) && ui.input(|i| i.pointer.press_origin()).is_some_and(in_ruler) {
             self.scrubbing = true;
         }

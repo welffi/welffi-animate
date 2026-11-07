@@ -1,8 +1,10 @@
 use crate::anim::Animation;
 use crate::editor::Editor;
 use crate::export::roblox_clipboard;
+use crate::rigs_menu;
 use crate::panels::{Panels, Tool};
 use crate::curve::Handle;
+use crate::library_view::LibraryView;
 use crate::project::{load_animation, load_session, load_settings, save_animation, save_session, save_settings, Session, Settings};
 use crate::props_panel::PropsPanel;
 use crate::render::load_parts;
@@ -14,9 +16,17 @@ use std::time::{Duration, Instant};
 
 const AUTOSAVE_EVERY: Duration = Duration::from_secs(2);
 
+#[derive(Clone, Copy, PartialEq)]
+enum Page {
+    Animate,
+    Library,
+}
+
 pub struct App {
     ed: Editor,
     path: Option<PathBuf>,
+    page: Page,
+    library: LibraryView,
     viewport: Viewport,
     timeline: Timeline,
     panels: Panels,
@@ -41,6 +51,8 @@ impl App {
         App {
             ed,
             path: session.path,
+            page: Page::Animate,
+            library: LibraryView::new(rs),
             viewport,
             timeline: Timeline::default(),
             panels: Panels::default(),
@@ -54,6 +66,9 @@ impl App {
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         egui::MenuBar::new().ui(ui, |ui| {
+            ui.selectable_value(&mut self.page, Page::Animate, "Animate");
+            ui.selectable_value(&mut self.page, Page::Library, "Library");
+            ui.separator();
             ui.menu_button("File", |ui| {
                 if ui.button("New            Ctrl+N").clicked() {
                     self.new_file();
@@ -113,9 +128,22 @@ impl App {
             if ui.selectable_label(self.props.open, "Props").on_hover_text("Add items the character holds, like a sword").clicked() {
                 self.props.open = !self.props.open;
             }
+            rigs_menu::menu(ui, &mut self.ed, &mut self.viewport);
             ui.separator();
-            if ui.button(RichText::new("Copy for Roblox").strong()).on_hover_text("Ctrl+Shift+C. Paste the text into the Roblox animation importer plugin.").clicked() {
-                self.export(ui.ctx());
+            let busy = self.viewport.busy() || self.timeline.busy() || self.panels.busy();
+            rigs_menu::chips(ui, &mut self.ed, &mut self.viewport, busy);
+            let copy = RichText::new("Copy for Roblox").strong();
+            if self.ed.anim.partner.is_some() {
+                ui.menu_button(copy, |ui| {
+                    for second in [false, true] {
+                        if ui.button(format!("Rig {}", second as u8 + 1)).clicked() {
+                            self.export(ui.ctx(), second);
+                            ui.close();
+                        }
+                    }
+                });
+            } else if ui.button(copy).on_hover_text("Ctrl+Shift+C. Paste the text into the Roblox animation importer plugin.").clicked() {
+                self.export(ui.ctx(), self.ed.anim.second);
             }
             ui.separator();
             let auto = RichText::new("Auto key").color(if self.ed.auto_key { egui::Color32::from_rgb(230, 70, 70) } else { ui.visuals().weak_text_color() });
@@ -125,17 +153,14 @@ impl App {
             ui.separator();
             self.play_controls(ui);
             ui.separator();
-            let mut fps = self.ed.anim.fps;
+            let (mut fps, mut end) = (self.ed.anim.fps, self.ed.anim.end);
             ui.label("FPS");
-            if ui.add(egui::DragValue::new(&mut fps).range(1..=240)).changed() {
-                self.ed.checkpoint();
-                self.ed.anim.fps = fps;
-            }
-            let mut end = self.ed.anim.end;
+            let fps_changed = ui.add(egui::DragValue::new(&mut fps).range(1..=240)).changed();
             ui.label("End");
-            if ui.add(egui::DragValue::new(&mut end).range(1..=100_000)).changed() {
+            let end_changed = ui.add(egui::DragValue::new(&mut end).range(1..=100_000)).changed();
+            if fps_changed || end_changed {
                 self.ed.checkpoint();
-                self.ed.anim.end = end;
+                self.ed.anim.set_timing(fps, end);
             }
         });
     }
@@ -185,7 +210,7 @@ impl App {
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
-        if ctx.egui_wants_keyboard_input() || self.viewport.busy() {
+        if ctx.egui_wants_keyboard_input() || self.viewport.busy() || self.page != Page::Animate {
             return;
         }
         let events = ctx.input(|i| i.events.clone());
@@ -199,7 +224,7 @@ impl App {
         let command_shift = Modifiers::COMMAND | Modifiers::SHIFT;
         let pressed = |modifiers: Modifiers, key: Key| ctx.input_mut(|i| i.consume_key(modifiers, key));
         if pressed(command_shift, Key::C) {
-            self.export(ctx);
+            self.export(ctx, self.ed.anim.second);
         }
         if pressed(command_shift, Key::V) {
             self.ed.paste_pose(true);
@@ -243,6 +268,9 @@ impl App {
         if pressed(Modifiers::NONE, Key::ArrowDown) {
             self.ed.jump_key(false);
         }
+        if pressed(Modifiers::SHIFT, Key::I) {
+            self.ed.key_both();
+        }
         if pressed(Modifiers::NONE, Key::I) {
             self.ed.insert_keys();
         }
@@ -254,14 +282,16 @@ impl App {
         }
     }
 
-    fn export(&mut self, ctx: &egui::Context) {
-        let export = roblox_clipboard(&self.ed.anim, &self.ed.rig);
+    fn export(&mut self, ctx: &egui::Context, second: bool) {
+        let Some((anim, rig)) = self.ed.rig_for(second) else { return };
+        let export = roblox_clipboard(anim, rig);
+        let who = if self.ed.anim.partner.is_some() { format!("Rig {}: ", second as u8 + 1) } else { String::new() };
         if export.keyframes == 0 {
-            self.ed.status = "Nothing to copy yet. Key a pose first".to_string();
+            self.ed.status = format!("{who}nothing to copy yet. Key a pose first");
             return;
         }
         ctx.copy_text(export.text);
-        self.ed.status = format!("Copied {} keyframes ({:.2}s) for Roblox. Paste it into the importer plugin", export.keyframes, export.seconds);
+        self.ed.status = format!("{who}copied {} keyframes ({:.2}s) for Roblox. Paste it into the importer plugin", export.keyframes, export.seconds);
     }
 
     fn new_file(&mut self) {
@@ -273,6 +303,10 @@ impl App {
 
     fn open(&mut self) {
         let Some(path) = rfd::FileDialog::new().add_filter("welffi animation", &["wanim"]).pick_file() else { return };
+        self.open_path(path);
+    }
+
+    fn open_path(&mut self, path: PathBuf) {
         match load_animation(&path) {
             Ok(anim) => {
                 self.ed.replace(anim);
@@ -346,16 +380,28 @@ impl eframe::App for App {
         self.shortcuts(&ctx);
         self.advance_playback(&ctx);
 
+        let rs = frame.wgpu_render_state().expect("wgpu renderer");
+        let page = self.page;
         egui::Panel::top("toolbar").show(ui, |ui| self.toolbar(ui));
+        if page != self.page && self.page == Page::Library {
+            self.library.open(rs);
+        }
         egui::Panel::bottom("status").show(ui, |ui| {
             ui.label(&self.ed.status);
         });
-        egui::Panel::bottom("timeline").resizable(true).default_size(210.0).frame(egui::Frame::NONE).show(ui, |ui| {
-            self.timeline.ui(ui, &mut self.ed);
-        });
-        egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
-            let rs = frame.wgpu_render_state().expect("wgpu renderer");
-            self.viewport.ui(ui, rs, &mut self.ed);
+        if self.page == Page::Animate {
+            egui::Panel::bottom("timeline").resizable(true).default_size(210.0).frame(egui::Frame::NONE).show(ui, |ui| {
+                self.timeline.ui(ui, &mut self.ed);
+            });
+        }
+        egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| match self.page {
+            Page::Animate => self.viewport.ui(ui, rs, &mut self.ed),
+            Page::Library => {
+                if let Some(path) = self.library.ui(ui, rs, &mut self.ed) {
+                    self.open_path(path);
+                    self.page = Page::Animate;
+                }
+            }
         });
 
         self.panels.ui(&ctx, &mut self.ed);

@@ -25,7 +25,7 @@ pub fn roblox_clipboard(anim: &Animation, rig: &Rig) -> Export {
 
 pub fn roblox_json(anim: &Animation, rig: &Rig) -> Value {
     let fps = anim.fps as f64;
-    let last = anim.key_frames().last().copied().unwrap_or(0).max(anim.end);
+    let last = anim.key_frames().last().copied().unwrap_or(0).max(anim.end).max(anim.last_marker().unwrap_or(0));
     let mut keyframes = Vec::new();
     for frame in 0..=last {
         let motors = rig.motors(&anim.poses(frame as f32));
@@ -36,8 +36,13 @@ pub fn roblox_json(anim: &Animation, rig: &Rig) -> Value {
                 poses.insert(joint.part.to_string(), json!([cframe_values(motors[i].matrix()), style, direction]));
             }
         }
-        if !poses.is_empty() {
-            keyframes.push(json!({ "t": frame as f64 / fps, "kf": poses }));
+        let markers = anim.marker_names_at(frame);
+        if !poses.is_empty() || !markers.is_empty() {
+            let mut keyframe = json!({ "t": frame as f64 / fps, "kf": poses });
+            if !markers.is_empty() {
+                keyframe["markers"] = json!(markers);
+            }
+            keyframes.push(keyframe);
         }
     }
     json!({ "t": anim.end as f64 / fps, "kfs": keyframes })
@@ -100,6 +105,26 @@ mod tests {
         assert_eq!(kfs[10]["kf"]["Left Arm"][1], "Constant");
         assert_eq!(kfs[11]["kf"]["Head"][1], "Linear");
         assert!((data["t"].as_f64().unwrap() - 20.0 / 60.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn markers_export_on_their_frame_even_with_no_pose_there() {
+        let mut empty = Animation { fps: 60, end: 20, ..Default::default() };
+        empty.add_marker(3, "Hit");
+        let data = roblox_json(&empty, &Rig::r6());
+        let kfs = data["kfs"].as_array().unwrap();
+        assert_eq!(kfs.len(), 1);
+        assert!((kfs[0]["t"].as_f64().unwrap() - 3.0 / 60.0).abs() < 1e-9);
+        assert!(kfs[0]["kf"].as_object().unwrap().is_empty());
+        assert_eq!(kfs[0]["markers"][0], "Hit");
+
+        let mut anim = sample_anim();
+        anim.add_marker(10, "Swing");
+        let data = roblox_json(&anim, &Rig::r6());
+        let swing = &data["kfs"][10];
+        assert_eq!(swing["markers"][0], "Swing");
+        assert!(swing["kf"]["Left Arm"].is_array());
+        assert!(data["kfs"][9]["markers"].is_null());
     }
 
     #[test]
