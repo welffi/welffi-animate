@@ -7,10 +7,12 @@ use crate::curve::Handle;
 use crate::library_view::LibraryView;
 use crate::project::{load_animation, load_session, load_settings, save_animation, save_session, save_settings, Session, Settings};
 use crate::props_panel::PropsPanel;
+use crate::reference_panel::ReferencePanel;
 use crate::render::load_parts;
-use crate::timeline::Timeline;
+use crate::timeline::{self, Timeline};
+use crate::timing_bar;
 use crate::viewport::Viewport;
-use eframe::egui::{self, Event, Key, Modifiers, RichText};
+use eframe::egui::{self, Align, Event, Key, Layout, Modifiers, RichText};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -31,6 +33,7 @@ pub struct App {
     timeline: Timeline,
     panels: Panels,
     props: PropsPanel,
+    reference: ReferencePanel,
     autosaved: u64,
     file_saved: u64,
     last_autosave: Instant,
@@ -57,6 +60,7 @@ impl App {
             timeline: Timeline::default(),
             panels: Panels::default(),
             props: PropsPanel::default(),
+            reference: ReferencePanel::default(),
             autosaved: 0,
             file_saved: 0,
             last_autosave: Instant::now(),
@@ -128,6 +132,9 @@ impl App {
             if ui.selectable_label(self.props.open, "Props").on_hover_text("Add items the character holds, like a sword").clicked() {
                 self.props.open = !self.props.open;
             }
+            if ui.selectable_label(self.reference.open, "Reference").on_hover_text("A docked GIF or video player to animate from").clicked() {
+                self.reference.open = !self.reference.open;
+            }
             rigs_menu::menu(ui, &mut self.ed, &mut self.viewport);
             ui.separator();
             let busy = self.viewport.busy() || self.timeline.busy() || self.panels.busy();
@@ -146,22 +153,7 @@ impl App {
                 self.export(ui.ctx(), self.ed.anim.second);
             }
             ui.separator();
-            let auto = RichText::new("Auto key").color(if self.ed.auto_key { egui::Color32::from_rgb(230, 70, 70) } else { ui.visuals().weak_text_color() });
-            if ui.selectable_label(self.ed.auto_key, auto).on_hover_text("When on, posing a part keys it at the current frame").clicked() {
-                self.ed.auto_key = !self.ed.auto_key;
-            }
-            ui.separator();
             self.play_controls(ui);
-            ui.separator();
-            let (mut fps, mut end) = (self.ed.anim.fps, self.ed.anim.end);
-            ui.label("FPS");
-            let fps_changed = ui.add(egui::DragValue::new(&mut fps).range(1..=240)).changed();
-            ui.label("End");
-            let end_changed = ui.add(egui::DragValue::new(&mut end).range(1..=100_000)).changed();
-            if fps_changed || end_changed {
-                self.ed.checkpoint();
-                self.ed.anim.set_timing(fps, end);
-            }
         });
     }
 
@@ -214,9 +206,12 @@ impl App {
             return;
         }
         let events = ctx.input(|i| i.events.clone());
+        let on_timeline = self.timeline.hovered;
         for event in &events {
             match event {
+                Event::Copy if on_timeline && !self.ed.keys.is_empty() => self.ed.copy_keys(),
                 Event::Copy => self.ed.copy_pose(),
+                Event::Paste(_) | Event::PasteImage(_) if on_timeline => self.ed.paste_keys(),
                 Event::Paste(_) | Event::PasteImage(_) => self.ed.paste_pose(false),
                 _ => {}
             }
@@ -379,6 +374,9 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         self.shortcuts(&ctx);
         self.advance_playback(&ctx);
+        if self.page == Page::Animate {
+            self.reference.accept_drop(&ctx);
+        }
 
         let rs = frame.wgpu_render_state().expect("wgpu renderer");
         let page = self.page;
@@ -386,13 +384,24 @@ impl eframe::App for App {
         if page != self.page && self.page == Page::Library {
             self.library.open(rs);
         }
+        let status = self.ed.status.clone();
         egui::Panel::bottom("status").show(ui, |ui| {
-            ui.label(&self.ed.status);
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if self.page == Page::Animate {
+                    timing_bar::ui(ui, &mut self.ed);
+                }
+                ui.with_layout(Layout::left_to_right(Align::Center), |ui| ui.add(egui::Label::new(status).truncate()));
+            });
         });
         if self.page == Page::Animate {
-            egui::Panel::bottom("timeline").resizable(true).default_size(210.0).frame(egui::Frame::NONE).show(ui, |ui| {
+            let rows_height = timeline::full_height(self.ed.anim.tracks.len());
+            egui::Panel::bottom("timeline").resizable(true).default_size(rows_height).min_size(rows_height).frame(egui::Frame::NONE).show(ui, |ui| {
                 self.timeline.ui(ui, &mut self.ed);
             });
+            if self.reference.open {
+                let playing = self.ed.playing;
+                egui::Panel::right("reference").resizable(true).default_size(340.0).show(ui, |ui| self.reference.ui(ui, playing));
+            }
         }
         egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| match self.page {
             Page::Animate => self.viewport.ui(ui, rs, &mut self.ed),

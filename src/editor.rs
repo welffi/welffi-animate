@@ -1,5 +1,6 @@
 use crate::anim::{Animation, KeyId};
 use crate::curve::Handle;
+use crate::key_clipboard::KeyClipboard;
 use crate::rigs::Stand;
 use crate::rig::{Pose, Rig};
 use std::collections::BTreeSet;
@@ -22,6 +23,7 @@ pub struct Editor {
     pub status: String,
     pub changes: u64,
     copied: Vec<Option<Pose>>,
+    key_clipboard: KeyClipboard,
     undo: Vec<Animation>,
     redo: Vec<Animation>,
 }
@@ -44,6 +46,7 @@ impl Editor {
             status: String::new(),
             changes: 0,
             copied: Vec::new(),
+            key_clipboard: KeyClipboard::default(),
             undo: Vec::new(),
             redo: Vec::new(),
         }
@@ -251,6 +254,25 @@ impl Editor {
         }
         self.finish_pose_edit(&joints);
         self.status = if mirrored { "Pasted mirrored pose".to_string() } else { "Pasted pose".to_string() };
+    }
+
+    pub fn copy_keys(&mut self) {
+        self.key_clipboard = KeyClipboard::copy(&self.anim, &self.keys);
+        let count = self.key_clipboard.len();
+        self.status = format!("Copied {count} key{}", if count == 1 { "" } else { "s" });
+    }
+
+    pub fn paste_keys(&mut self) {
+        if self.key_clipboard.is_empty() {
+            self.status = "No keys copied yet. Select keys and press Ctrl+C".to_string();
+            return;
+        }
+        self.checkpoint();
+        let at = self.current();
+        self.keys = self.key_clipboard.paste(&mut self.anim, at);
+        self.clear_overrides();
+        let count = self.keys.len();
+        self.status = format!("Pasted {count} key{} at frame {}", if count == 1 { "" } else { "s" }, self.current());
     }
 
     pub fn delete_keys(&mut self) {

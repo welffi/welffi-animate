@@ -149,6 +149,12 @@ impl Track {
         self.recalc();
     }
 
+    pub fn put(&mut self, key: Key) {
+        self.keys.retain(|k| k.frame != key.frame);
+        self.keys.push(key);
+        self.keys.sort_by_key(|k| k.frame);
+    }
+
     pub fn drag_handle(&mut self, channel: usize, frame: i32, side: Side, offset: Vec2) {
         let Some(key) = self.key_at_mut(frame) else { return };
         let mut point = key.point(channel);

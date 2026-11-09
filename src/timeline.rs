@@ -88,6 +88,10 @@ impl Layout {
     }
 }
 
+pub fn full_height(tracks: usize) -> f32 {
+    RULER_HEIGHT + MARKER_LANE + (tracks + 1) as f32 * ROW_HEIGHT + 4.0
+}
+
 impl Timeline {
     pub fn busy(&self) -> bool {
         self.drag.is_some() || self.scrubbing || self.graph.busy() || self.markers.busy()
